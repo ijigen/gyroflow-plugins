@@ -2,7 +2,10 @@
 use lru::LruCache;
 use parking_lot::{ Mutex, RwLock };
 use std::cell::Cell;
+use std::hash::{Hash, Hasher};
 use std::sync::{ Arc, atomic::AtomicBool };
+
+mod cdng;
 
 pub use gyroflow_core::{ StabilizationManager, keyframes::*, stabilization::*, filesystem, gpu::* };
 pub use gyroflow_core;
@@ -271,7 +274,7 @@ impl GyroflowPluginBase {
             ParameterType::Group { id: "ProjectGroup", label: "Gyroflow project", opened: true, parameters: vec![
                 ParameterType::Text    { id: "Status",            label: "Status",                   hint: "Status" },
                 ParameterType::Button  { id: "LoadCurrent",       label: "Load for current file",    hint: "Try to load project file for current video file, or try to stabilize that video file directly" },
-                ParameterType::Button  { id: "Browse",            label: "Browse",                   hint: "Browse for the Gyroflow project file" },
+                ParameterType::Button  { id: "Browse",            label: "Browse",                   hint: "Browse for a video, a CinemaDNG frame, or a Gyroflow project file" },
                 ParameterType::Button  { id: "LoadLens",          label: "Load preset/lens profile", hint: "Browse for the lens profile or a preset" },
                 ParameterType::Button  { id: "OpenGyroflow",      label: "Open Gyroflow",            hint: "Open project in Gyroflow" },
                 ParameterType::Button  { id: "ReloadProject",     label: "Reload project",           hint: "Reload currently loaded project" },
@@ -586,11 +589,66 @@ impl GyroflowPluginBaseInstance {
             }
 
             if !path.ends_with(".gyroflow") {
-                let url = filesystem::path_to_url(&path);
-                let mut file = filesystem::open_file(&url, false, false)?;
-                let filesize = file.size;
-                match stab.load_video_file(file.get_file(), filesize, &url, None, true) {
+                let cdng_sequence = if path.to_ascii_lowercase().ends_with(".dng") {
+                    match cdng::read_embedded_protobuf_sequence(std::path::Path::new(&path)) {
+                        Ok(sequence) => Some(sequence),
+                        Err(error) => {
+                            self.update_loaded_state(params, false);
+                            params.set_string(Params::Status, "Failed to load CinemaDNG telemetry")?;
+                            params.set_hint(Params::Status, &error)?;
+                            return Err(error.into());
+                        }
+                    }
+                } else {
+                    None
+                };
+                let load_result = if let Some(sequence) = cdng_sequence.as_ref() {
+                    // The Protobuf header supplies the clip properties, so core can
+                    // initialize the sequence without probing a video container.
+                    // Passing JSONL here lets core parse telemetry before its normal
+                    // camera/lens profile selection runs.
+                    let video_metadata = gyroflow_core::telemetry_parser::util::VideoMetadata {
+                        width: sequence.width,
+                        height: sequence.height,
+                        fps: sequence.fps,
+                        duration_s: sequence.frame_count as f64 / sequence.fps,
+                        rotation: sequence.rotation,
+                    };
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    sequence.jsonl.hash(&mut hasher);
+                    let virtual_path = std::path::Path::new(&path)
+                        .with_extension(format!("cdng-{:016x}.jsonl", hasher.finish()));
+                    let virtual_url = filesystem::path_to_url(&virtual_path.to_string_lossy());
+                    let mut stream = std::io::Cursor::new(&sequence.jsonl);
+                    stab.load_video_file(&mut stream, sequence.jsonl.len(), &virtual_url, Some(video_metadata), true)
+                } else {
+                    let url = filesystem::path_to_url(&path);
+                    let mut file = filesystem::open_file(&url, false, false)?;
+                    let filesize = file.size;
+                    stab.load_video_file(file.get_file(), filesize, &url, None, true)
+                };
+                match load_result {
                     Ok(md) => {
+                        if let Some(sequence) = cdng_sequence {
+                            // The pinned core ignores errors from load_gyro_data.
+                            // Gyroflow Protobuf emits one timing offset per frame,
+                            // so require every JSONL record to reach the parser.
+                            if stab.gyro.read().file_metadata.read().per_frame_time_offsets.len() != sequence.frame_count {
+                                self.update_loaded_state(params, false);
+                                params.set_string(Params::Status, "Failed to load CinemaDNG telemetry")?;
+                                params.set_hint(Params::Status, "Gyroflow could not parse the embedded Protobuf stream")?;
+                                return Err("Gyroflow could not parse the embedded Protobuf stream".into());
+                            }
+                            // Preserve the real source path for Gyroflow project data.
+                            let source_url = filesystem::path_to_url(&path);
+                            stab.gyro.write().file_url = source_url.clone();
+                            stab.input_file.write().url = source_url;
+                            // Avoid deriving the frame count by rounding duration * fps.
+                            // That floating-point round-trip can add one phantom frame.
+                            let mut clip_params = stab.params.write();
+                            clip_params.frame_count = sequence.frame_count;
+                            clip_params.duration_ms = sequence.frame_count as f64 * 1000.0 / sequence.fps;
+                        }
                         if out_size != (0, 0) {
                             stab.params.write().output_size = out_size; // Default to timeline output size
                         }
@@ -887,7 +945,7 @@ impl GyroflowPluginBaseInstance {
 
     pub fn browse(current_path: &str) -> String {
         let mut d = rfd::FileDialog::new()
-            .add_filter("Project and video files", &["mp4", "mov", "mxf", "braw", "r3d", "insv", "gyroflow"]);
+            .add_filter("Project and video files", &["mp4", "mov", "mxf", "braw", "r3d", "insv", "dng", "gyroflow"]);
         if !current_path.is_empty() {
             if let Some(path) = std::path::Path::new(current_path).parent() {
                 d = d.set_directory(path);

@@ -1179,6 +1179,7 @@ dependencies = [
  "mimalloc",
  "oslog",
  "parking_lot",
+ "prost",
  "rfd",
  "serde",
  "serde_json",

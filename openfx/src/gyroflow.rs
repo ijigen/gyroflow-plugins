@@ -508,7 +508,7 @@ impl Execute for GyroflowPlugin {
                 }
                 if let Ok(path) = props.get_src_file_path() {
                     if !path.is_empty() {
-                        instance_data.file_path = Some(path.clone());
+                        instance_data.file_path = Some(replace_frame_count(&path));
                     }
                 }
 

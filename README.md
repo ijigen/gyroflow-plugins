@@ -36,6 +36,8 @@
 </p>
 
 # Gyroflow plugin for video editors
+
+This fork includes an [experimental CinemaDNG Protobuf path for the OpenFX plugin](docs/cdng-protobuf-prototype.md).
 Gyroflow plugin for a video editor allows you to stabilize the video directly inside the video editor, where you work with the original video file, instead of rendering a stabilized video in the app and then importing it to the video editor.
 
 If your camera has official lens profiles and accurate gyro timing (GoPro 8+, Sony, Insta360, DJI), then you should be able to just apply the plugin to your clip. In the Adobe and Final Cut Pro plugin, it should load the gyro data automatically. In Resolve, you should click "Load for current file" or use the "Browse" button to select your video file or the `.gyroflow` project file.
