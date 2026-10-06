@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use gyroflow_core::telemetry_parser::gyroflow::{gyroflow_proto, proto_json};
 use prost::Message;
 
+use crate::fsg2;
+
 const PROTOTYPE_TAG: u16 = 65000;
 const EXIF_IFD_TAG: u16 = 0x8769;
 const MAKER_NOTE_TAG: u16 = 0x927C;
@@ -23,6 +25,8 @@ const MAKER_NOTE_TAG: u16 = 0x927C;
 const MAKER_NOTE_MAGIC: &[u8; 4] = b"FSG2";
 const BLOCK_VERSION: u8 = 1;
 const BLOCK_KIND_PROTOBUF: u8 = 1;
+const BLOCK_KIND_GYRO2: u8 = 2;
+const MAX_VALUE_BYTES: usize = 64 * 1024;
 const BLOCK_HEADER_BYTES: usize = 12;
 const MAX_MAKER_NOTE_BYTES: usize = 1024 * 1024;
 const MAX_PROTO_BYTES: usize = 4 * 1024 * 1024;
@@ -82,11 +86,8 @@ pub fn read_embedded_protobuf_sequence(path: &Path) -> Result<SequenceData, Stri
     let mut expected_header: Option<gyroflow_proto::Header> = None;
     let mut clip_properties = None;
 
-    for (index, frame_path) in paths.iter().enumerate() {
-        let payload = read_frame_payload(frame_path)
-            .map_err(|error| format!("{}: {error}", frame_path.display()))?;
-        let main = gyroflow_proto::Main::decode(payload.as_slice())
-            .map_err(|error| format!("{}: invalid Gyroflow Protobuf: {error}", frame_path.display()))?;
+    let messages = read_messages(&paths)?;
+    for (index, (frame_path, main)) in paths.iter().zip(messages).enumerate() {
 
         if main.magic_string != "GyroflowProtobuf" {
             return Err(format!("{}: invalid Gyroflow Protobuf magic", frame_path.display()));
@@ -154,6 +155,31 @@ pub fn read_embedded_protobuf_sequence(path: &Path) -> Result<SequenceData, Stri
 
     let (width, height, fps, rotation) = clip_properties.expect("nonempty sequence");
     Ok(SequenceData { jsonl, frame_count: paths.len(), width, height, fps, rotation })
+}
+
+/// Read every frame's carrier and turn the whole take into `Main` messages.
+///
+/// Serialized-protobuf carriers decode frame by frame; kind 2 records are
+/// converted together, because samples are deduplicated and the accelerometer
+/// is held across frame boundaries. A take must use one carrier throughout.
+fn read_messages(paths: &[PathBuf]) -> Result<Vec<gyroflow_proto::Main>, String> {
+    let mut protobuf = Vec::new();
+    let mut gyro2 = Vec::new();
+    for frame_path in paths {
+        let in_frame = |error: String| format!("{}: {error}", frame_path.display());
+        match read_frame(frame_path).map_err(in_frame)? {
+            (FramePayload::Protobuf(bytes), _) => protobuf.push(
+                gyroflow_proto::Main::decode(bytes.as_slice())
+                    .map_err(|error| in_frame(format!("invalid Gyroflow Protobuf: {error}")))?,
+            ),
+            (FramePayload::Gyro2(bytes), dng) => gyro2.push((fsg2::parse(&bytes).map_err(in_frame)?, dng)),
+        }
+    }
+    match (protobuf.is_empty(), gyro2.is_empty()) {
+        (_, true) => Ok(protobuf),
+        (true, false) => fsg2::to_messages(&gyro2),
+        (false, false) => Err("DNG sequence mixes serialized-protobuf frames with kind 2 frames".to_owned()),
+    }
 }
 
 fn sequence_paths(first: &Path) -> Result<Vec<PathBuf>, String> {
@@ -306,6 +332,58 @@ impl TiffReader {
         Ok(data)
     }
 
+    /// Raw bytes of any entry whose values total at most `MAX_VALUE_BYTES`.
+    fn raw(&mut self, entry: &IfdEntry) -> Result<Vec<u8>, String> {
+        let size = match entry.kind {
+            1 | 2 | 6 | 7 => 1,
+            3 | 8 => 2,
+            4 | 9 | 11 | 13 => 4,
+            5 | 10 | 12 => 8,
+            kind => return Err(format!("unknown TIFF type {kind}")),
+        };
+        let len = (entry.count as usize).checked_mul(size).filter(|len| *len <= MAX_VALUE_BYTES)
+            .ok_or("TIFF value is too large")?;
+        let mut data = vec![0_u8; len];
+        if len <= 4 {
+            data.copy_from_slice(&entry.value[..len]);
+        } else {
+            let offset = u64::from(self.order.u32(&entry.value));
+            read_exact_at(&mut self.file, self.file_len, offset, &mut data)?;
+        }
+        Ok(data)
+    }
+
+    fn ascii(&mut self, entry: &IfdEntry) -> Result<String, String> {
+        if entry.kind != 2 { return Err("not ASCII".to_owned()); }
+        let data = self.raw(entry)?;
+        let end = data.iter().position(|byte| *byte == 0).unwrap_or(data.len());
+        Ok(String::from_utf8_lossy(&data[..end]).into_owned())
+    }
+
+    /// Numeric values of an entry as f64; rationals are divided out.
+    fn numbers(&mut self, entry: &IfdEntry) -> Result<Vec<f64>, String> {
+        let data = self.raw(entry)?;
+        let order = self.order;
+        let n = entry.count as usize;
+        let at = |i: usize, w: usize| &data[i * w..i * w + w];
+        Ok(match entry.kind {
+            1 => data.iter().map(|v| *v as f64).collect(),
+            3 => (0..n).map(|i| order.u16(at(i, 2)) as f64).collect(),
+            8 => (0..n).map(|i| order.u16(at(i, 2)) as i16 as f64).collect(),
+            4 => (0..n).map(|i| order.u32(at(i, 4)) as f64).collect(),
+            9 => (0..n).map(|i| order.u32(at(i, 4)) as i32 as f64).collect(),
+            5 => (0..n).map(|i| {
+                let (num, den) = (order.u32(&at(i, 8)[..4]), order.u32(&at(i, 8)[4..]));
+                if den == 0 { f64::NAN } else { num as f64 / den as f64 }
+            }).collect(),
+            10 => (0..n).map(|i| {
+                let (num, den) = (order.u32(&at(i, 8)[..4]) as i32, order.u32(&at(i, 8)[4..]) as i32);
+                if den == 0 { f64::NAN } else { num as f64 / den as f64 }
+            }).collect(),
+            kind => return Err(format!("TIFF type {kind} is not numeric here")),
+        })
+    }
+
     /// Offset stored in a single LONG or IFD entry that points to a sub-IFD.
     fn sub_ifd_offset(&self, entry: &IfdEntry, what: &str) -> Result<u64, String> {
         if (entry.kind != 4 && entry.kind != 13) || entry.count != 1 {
@@ -324,28 +402,82 @@ fn find_unique<'a>(entries: &'a [IfdEntry], tag: u16, what: &str) -> Result<Opti
     Ok(first)
 }
 
-/// Read the serialized `gyroflow_proto::Main` carried by one DNG frame.
+/// What one DNG frame carries.
+enum FramePayload {
+    /// A serialized `gyroflow_proto::Main` (IFD0 tag 65000, or block kind 1).
+    Protobuf(Vec<u8>),
+    /// A SIGMA fp gyro record (block kind 2), decoded by `fsg2`.
+    Gyro2(Vec<u8>),
+}
+
+#[cfg(test)]
+fn read_frame_payload(path: &Path) -> Result<Vec<u8>, String> {
+    read_frame(path).map(|(payload, _)| match payload {
+        FramePayload::Protobuf(bytes) | FramePayload::Gyro2(bytes) => bytes,
+    })
+}
+
+/// Read the telemetry carried by one DNG frame, and the frame's own metadata.
 ///
 /// The primary carrier is a framed block in the unused zero tail of the
 /// MakerNote (see `parse_makernote_block`). The older prototype carrier, IFD0
 /// tag 65000, is still accepted and takes precedence when present.
-fn read_frame_payload(path: &Path) -> Result<Vec<u8>, String> {
+fn read_frame(path: &Path) -> Result<(FramePayload, fsg2::DngInfo), String> {
     let mut tiff = TiffReader::open(path)?;
     let root_offset = tiff.root_ifd_offset()?;
     let root = tiff.read_ifd(root_offset)?;
+    let exif = match find_unique(&root, EXIF_IFD_TAG, "Exif IFD pointer")? {
+        Some(entry) => {
+            let offset = tiff.sub_ifd_offset(entry, "Exif IFD pointer")?;
+            tiff.read_ifd(offset)?
+        }
+        None => Vec::new(),
+    };
+    let dng = read_dng_info(&mut tiff, &root, &exif);
 
     if let Some(entry) = find_unique(&root, PROTOTYPE_TAG, "experimental Protobuf tag")? {
-        return tiff.byte_data(entry, MAX_PROTO_BYTES, "experimental Protobuf tag payload");
+        let bytes = tiff.byte_data(entry, MAX_PROTO_BYTES, "experimental Protobuf tag payload")?;
+        return Ok((FramePayload::Protobuf(bytes), dng));
     }
-
-    let exif_entry = find_unique(&root, EXIF_IFD_TAG, "Exif IFD pointer")?
-        .ok_or_else(|| "no telemetry: IFD0 has neither tag 65000 nor an Exif IFD".to_owned())?;
-    let exif_offset = tiff.sub_ifd_offset(exif_entry, "Exif IFD pointer")?;
-    let exif = tiff.read_ifd(exif_offset)?;
+    if find_unique(&root, EXIF_IFD_TAG, "Exif IFD pointer")?.is_none() {
+        return Err("no telemetry: IFD0 has neither tag 65000 nor an Exif IFD".to_owned());
+    }
     let maker_note = find_unique(&exif, MAKER_NOTE_TAG, "MakerNote")?
         .ok_or_else(|| "no telemetry: Exif IFD has no MakerNote".to_owned())?;
     let maker_note = tiff.byte_data(maker_note, MAX_MAKER_NOTE_BYTES, "MakerNote")?;
-    parse_makernote_block(&maker_note).map(<[u8]>::to_vec)
+    let (kind, payload) = parse_makernote_block(&maker_note)?;
+    let payload = payload.to_vec();
+    Ok((if kind == BLOCK_KIND_GYRO2 { FramePayload::Gyro2(payload) } else { FramePayload::Protobuf(payload) }, dng))
+}
+
+/// The frame's own EXIF/DNG values. Missing or malformed tags are left as
+/// `None`: they are refinements, and kind 2 checks the ones it cannot do without.
+fn read_dng_info(tiff: &mut TiffReader, root: &[IfdEntry], exif: &[IfdEntry]) -> fsg2::DngInfo {
+    let mut text = |entries: &[IfdEntry], tag: u16| {
+        entries.iter().find(|entry| entry.tag == tag).and_then(|entry| tiff.ascii(entry).ok())
+            .map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
+    };
+    let make = text(root, 0x010F);
+    let model = text(root, 0x0110);
+    let software = text(root, 0x0131);
+    let serial = text(root, 0xC62F);
+    let lens_model = text(exif, 0xA434);
+    let mut number = |entries: &[IfdEntry], tag: u16| -> Option<Vec<f64>> {
+        entries.iter().find(|entry| entry.tag == tag).and_then(|entry| tiff.numbers(entry).ok())
+    };
+    let frame_size = number(root, 0xC620)
+        .filter(|v| v.len() == 2 && v[0] > 0.0 && v[1] > 0.0 && v[0] <= MAX_DIMENSION as f64 && v[1] <= MAX_DIMENSION as f64)
+        .map(|v| (v[0].round() as u32, v[1].round() as u32));
+    let first = |v: Option<Vec<f64>>| v.and_then(|v| v.first().copied()).filter(|x| x.is_finite() && *x > 0.0);
+    fsg2::DngInfo {
+        make, model, serial, software, lens_model, frame_size,
+        frame_rate: first(number(root, 0xC764)).filter(|fps| *fps <= MAX_FPS),
+        exposure_s: first(number(exif, 0x829A)),
+        iso: first(number(exif, 0x8827)).map(|iso| iso.round() as u32),
+        f_number: first(number(exif, 0x829D)),
+        focal_length_mm: first(number(exif, 0x920A)),
+        subject_distance_m: first(number(exif, 0x9206)),
+    }
 }
 
 /// Find the telemetry block inside a MakerNote and return its payload.
@@ -356,7 +488,8 @@ fn read_frame_payload(path: &Path) -> Result<Vec<u8>, String> {
 /// ```text
 ///   0  magic           4 bytes, MAKER_NOTE_MAGIC
 ///   4  version         u8, 1
-///   5  payload kind    u8, 1 = serialized gyroflow_proto::Main
+///   5  payload kind    u8, 1 = serialized gyroflow_proto::Main,
+///                          2 = SIGMA fp gyro record (see fsg2.rs)
 ///   6  reserved        u16, 0
 ///   8  payload length  u32
 ///  12  payload
@@ -367,31 +500,31 @@ fn read_frame_payload(path: &Path) -> Result<Vec<u8>, String> {
 /// the declared MakerNote range, so it is carried along by anything that
 /// copies the MakerNote, without adding IFD entries. Every candidate magic
 /// must pass the length and CRC checks; exactly one valid block is required.
-fn parse_makernote_block(maker_note: &[u8]) -> Result<&[u8], String> {
-    let mut found: Option<&[u8]> = None;
+fn parse_makernote_block(maker_note: &[u8]) -> Result<(u8, &[u8]), String> {
+    let mut found: Option<(u8, &[u8])> = None;
     let mut rejected = None;
     let mut start = 0;
     while let Some(position) = find_bytes(&maker_note[start..], MAKER_NOTE_MAGIC) {
         let at = start + position;
         start = at + 1;
         match parse_block_at(maker_note, at) {
-            Ok(payload) => {
+            Ok(block) => {
                 if found.is_some() {
                     return Err("more than one telemetry block in MakerNote".to_owned());
                 }
-                found = Some(payload);
+                found = Some(block);
             }
             Err(error) => rejected = Some(error),
         }
     }
     match (found, rejected) {
-        (Some(payload), _) => Ok(payload),
+        (Some(block), _) => Ok(block),
         (None, Some(error)) => Err(format!("invalid telemetry block in MakerNote: {error}")),
         (None, None) => Err("no telemetry block in MakerNote".to_owned()),
     }
 }
 
-fn parse_block_at(data: &[u8], at: usize) -> Result<&[u8], String> {
+fn parse_block_at(data: &[u8], at: usize) -> Result<(u8, &[u8]), String> {
     let header = data.get(at..at + BLOCK_HEADER_BYTES).ok_or("truncated block header")?;
     let version = header[4];
     let kind = header[5];
@@ -411,10 +544,10 @@ fn parse_block_at(data: &[u8], at: usize) -> Result<&[u8], String> {
     if crc32fast::hash(&data[at..payload_end]) != stored_crc {
         return Err("block CRC mismatch".to_owned());
     }
-    if kind != BLOCK_KIND_PROTOBUF {
+    if kind != BLOCK_KIND_PROTOBUF && kind != BLOCK_KIND_GYRO2 {
         return Err(format!("unsupported block payload kind {kind}"));
     }
-    Ok(&data[at + BLOCK_HEADER_BYTES..payload_end])
+    Ok((kind, &data[at + BLOCK_HEADER_BYTES..payload_end]))
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -786,7 +919,7 @@ mod tests {
         let real = block(&message(1, true).encode_to_vec(), BLOCK_KIND_PROTOBUF);
         let mut note = b"vendor FSG2 text that is not a block ".to_vec();
         note.extend(maker_note_with(&[real.clone()]));
-        assert_eq!(parse_makernote_block(&note).unwrap(), &real[BLOCK_HEADER_BYTES..real.len() - 4]);
+        assert_eq!(parse_makernote_block(&note).unwrap(), (BLOCK_KIND_PROTOBUF, &real[BLOCK_HEADER_BYTES..real.len() - 4]));
     }
 
     #[test]
@@ -801,9 +934,9 @@ mod tests {
     fn maker_note_without_block_and_unknown_kind_are_reported() {
         let error = parse_makernote_block(&maker_note_with(&[])).unwrap_err();
         assert!(error.contains("no telemetry block"), "{error}");
-        let compressed = block(b"future compressed payload", 2);
-        let error = parse_makernote_block(&maker_note_with(&[compressed])).unwrap_err();
-        assert!(error.contains("unsupported block payload kind 2"), "{error}");
+        let unknown = block(b"a payload kind nobody defined", 3);
+        let error = parse_makernote_block(&maker_note_with(&[unknown])).unwrap_err();
+        assert!(error.contains("unsupported block payload kind 3"), "{error}");
     }
 
     #[test]
@@ -857,5 +990,227 @@ mod tests {
         assert_eq!(sequence.frame_count, 2);
         // The untouched camera frame has no block: only the injected copies do.
         assert!(read_frame_payload(Path::new(&source)).unwrap_err().contains("no telemetry block"));
+    }
+
+    /// A little-endian TIFF with the given IFD0 and Exif IFD entries
+    /// (tag, type, count, value bytes); the Exif pointer is added and every
+    /// IFD is sorted, as TIFF requires.
+    fn tiff_le(mut root: Vec<(u16, u16, u32, Vec<u8>)>, mut exif: Vec<(u16, u16, u32, Vec<u8>)>) -> Vec<u8> {
+        root.push((EXIF_IFD_TAG, 4, 1, vec![0; 4]));
+        root.sort_by_key(|entry| entry.0);
+        exif.sort_by_key(|entry| entry.0);
+        let ifd_len = |n: usize| 2 + 12 * n + 4;
+        let root_at = 8;
+        let exif_at = root_at + ifd_len(root.len());
+        let mut data_at = exif_at + ifd_len(exif.len());
+        let mut out = b"II\x2a\0".to_vec();
+        out.extend_from_slice(&(root_at as u32).to_le_bytes());
+        let mut data = Vec::new();
+        let mut write_ifd = |out: &mut Vec<u8>, entries: &[(u16, u16, u32, Vec<u8>)], data_at: &mut usize| {
+            out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+            for (tag, kind, count, bytes) in entries {
+                out.extend_from_slice(&tag.to_le_bytes());
+                out.extend_from_slice(&kind.to_le_bytes());
+                out.extend_from_slice(&count.to_le_bytes());
+                if *tag == EXIF_IFD_TAG {
+                    out.extend_from_slice(&(exif_at as u32).to_le_bytes());
+                } else if bytes.len() <= 4 {
+                    let mut inline = bytes.clone();
+                    inline.resize(4, 0);
+                    out.extend_from_slice(&inline);
+                } else {
+                    out.extend_from_slice(&(*data_at as u32).to_le_bytes());
+                    *data_at += bytes.len();
+                    data.extend_from_slice(bytes);
+                }
+            }
+            out.extend_from_slice(&0_u32.to_le_bytes());
+        };
+        write_ifd(&mut out, &root, &mut data_at);
+        write_ifd(&mut out, &exif, &mut data_at);
+        out.extend_from_slice(&data);
+        out
+    }
+
+    fn ascii(text: &str) -> (u32, Vec<u8>) {
+        let mut bytes = text.as_bytes().to_vec();
+        bytes.push(0);
+        (bytes.len() as u32, bytes)
+    }
+
+    fn rational(num: u32, den: u32) -> Vec<u8> {
+        [num.to_le_bytes(), den.to_le_bytes()].concat()
+    }
+
+    /// An fp-like CinemaDNG frame: FHD, 29.97 fps, 1/60 s, with `block` in the MakerNote tail.
+    fn write_fp_like_frame(path: &Path, block: Vec<u8>) {
+        let (make_n, make) = ascii("SIGMA");
+        let (model_n, model) = ascii("SIGMA fp");
+        let (lens_n, lens) = ascii("28mm F1.4 DG HSM | Art 019");
+        let note = maker_note_with(&[block]);
+        let bytes = tiff_le(
+            vec![
+                (0x010F, 2, make_n, make),
+                (0x0110, 2, model_n, model),
+                (0xC620, 3, 2, [1920_u16.to_le_bytes(), 1080_u16.to_le_bytes()].concat()),
+                (0xC764, 10, 1, rational(30000, 1001)),
+            ],
+            vec![
+                (0x829A, 5, 1, rational(1, 60)),
+                (0x8827, 3, 1, 100_u16.to_le_bytes().to_vec()),
+                (0x920A, 5, 1, rational(28, 1)),
+                (0x9206, 5, 1, rational(403, 1000)),
+                (0xA434, 2, lens_n, lens),
+                (MAKER_NOTE_TAG, 7, note.len() as u32, note),
+            ],
+        );
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn gyro2_record(base_idx: u32, frame_seq: u32, n: usize) -> fsg2::Record {
+        fsg2::Record {
+            orientation: 0,
+            flags: if frame_seq == 0 { fsg2::FLAG_FIRST_FRAME } else { 0 },
+            clip_id: 0xC0FFEE,
+            frame_seq,
+            sample_period_ps: 400_085_400,
+            gscale: 0.000137923,
+            ascale: 0.0009765625,
+            readout_ns: 10_556_000,
+            mode_id: 106,
+            crop: [0, 0, 6000, 3376],
+            frame_mark: 4,
+            base_idx,
+            // A slow pan: about 5 deg/s on the first axis, with some wobble.
+            samples: (0..n).map(|i| [600 + (i as i16 % 7) * 3, -20, 15]).collect(),
+            events: vec![fsg2::Event { pos: 1, kind: fsg2::EVENT_LEVEL, value: [12_i16, -8, 1020].iter().flat_map(|v| v.to_le_bytes()).collect() }],
+            lens_table: None,
+        }
+    }
+
+    #[test]
+    fn kind2_sequence_runs_through_core() {
+        let dir = TestDir::new();
+        // 29.97 fps at 2499.5 Hz is about 83.4 samples a frame; each block
+        // carries 4 guard samples that overlap the next one.
+        let per_frame = 83;
+        let frames = 5_u32;
+        for seq in 0..frames {
+            let record = gyro2_record(seq * per_frame, seq, per_frame as usize + 4);
+            write_fp_like_frame(&dir.frame(seq + 1), block(&fsg2::encode(&record), BLOCK_KIND_GYRO2));
+        }
+        let sequence = read_embedded_protobuf_sequence(&dir.frame(1)).unwrap();
+        assert_eq!(sequence.frame_count, frames as usize);
+        assert_eq!((sequence.width, sequence.height), (1920, 1080));
+        assert!((sequence.fps - 29.97).abs() < 0.01);
+
+        let metadata = gyroflow_core::telemetry_parser::util::VideoMetadata {
+            width: sequence.width,
+            height: sequence.height,
+            fps: sequence.fps,
+            duration_s: sequence.frame_count as f64 / sequence.fps,
+            rotation: sequence.rotation,
+        };
+        let virtual_url = gyroflow_core::filesystem::path_to_url(&dir.0.join("t.jsonl").to_string_lossy());
+        let mut stream = std::io::Cursor::new(sequence.jsonl.as_slice());
+        let manager = gyroflow_core::StabilizationManager::default();
+        manager.load_video_file(&mut stream, sequence.jsonl.len(), &virtual_url, Some(metadata), true).unwrap();
+        let gyro = manager.gyro.read();
+        let file_metadata = gyro.file_metadata.read();
+        assert_eq!(file_metadata.per_frame_time_offsets.len(), frames as usize);
+        // Guards are deduplicated: every global sample index appears once.
+        assert_eq!(file_metadata.raw_imu.len(), (frames * per_frame + 4) as usize);
+        assert!(file_metadata.has_accurate_timestamps);
+        assert_eq!(file_metadata.imu_orientation.as_deref(), Some("xyz"));
+        let readout_ms = file_metadata.frame_readout_time.unwrap();
+        assert!((readout_ms - 10.556).abs() < 1e-3, "{readout_ms}");
+        assert!(!gyro.quaternions.is_empty());
+        assert!(gyro.quaternions.values().all(|q| q.coords.iter().all(|c| c.is_finite())));
+    }
+
+    #[test]
+    fn kind2_and_protobuf_frames_cannot_share_a_take() {
+        let dir = TestDir::new();
+        write_maker_note_frame(&dir.frame(1), &message(1, true), ByteOrder::Little);
+        write_fp_like_frame(&dir.frame(2), block(&fsg2::encode(&gyro2_record(0, 1, 10)), BLOCK_KIND_GYRO2));
+        let error = read_embedded_protobuf_sequence(&dir.frame(1)).unwrap_err();
+        assert!(error.contains("mixes"), "{error}");
+    }
+
+    #[test]
+    fn dng_info_reads_fp_like_tags() {
+        let dir = TestDir::new();
+        write_fp_like_frame(&dir.frame(1), block(&fsg2::encode(&gyro2_record(0, 0, 1)), BLOCK_KIND_GYRO2));
+        let (_, dng) = read_frame(&dir.frame(1)).unwrap();
+        assert_eq!(dng.make.as_deref(), Some("SIGMA"));
+        assert_eq!(dng.lens_model.as_deref(), Some("28mm F1.4 DG HSM | Art 019"));
+        assert_eq!(dng.frame_size, Some((1920, 1080)));
+        assert!((dng.frame_rate.unwrap() - 29.97).abs() < 0.01);
+        assert!((dng.exposure_s.unwrap() - 1.0 / 60.0).abs() < 1e-9);
+        assert_eq!(dng.iso, Some(100));
+        assert_eq!(dng.focal_length_mm, Some(28.0));
+        assert!((dng.subject_distance_m.unwrap() - 0.403).abs() < 1e-9);
+    }
+
+    /// Real-camera check for kind 2, skipped by default:
+    /// `FP_DNG_SAMPLE=/path/A001_001_..._000001.DNG cargo test real_fp -- --ignored --nocapture`
+    /// Writes kind 2 blocks into the MakerNote tail of copies of a real frame,
+    /// so the real EXIF (size, rate, exposure, lens) feeds the conversion, and
+    /// loads the result into gyroflow-core.
+    #[test]
+    #[ignore]
+    fn real_fp_dng_kind2_through_core() {
+        let source = std::env::var("FP_DNG_SAMPLE").expect("set FP_DNG_SAMPLE to an fp CinemaDNG frame");
+        let original = fs::read(&source).unwrap();
+        let mut tiff = TiffReader::open(Path::new(&source)).unwrap();
+        let root_offset = tiff.root_ifd_offset().unwrap();
+        let root = tiff.read_ifd(root_offset).unwrap();
+        let exif_offset = tiff.sub_ifd_offset(find_unique(&root, EXIF_IFD_TAG, "Exif").unwrap().unwrap(), "Exif").unwrap();
+        let exif = tiff.read_ifd(exif_offset).unwrap();
+        let note = find_unique(&exif, MAKER_NOTE_TAG, "MakerNote").unwrap().unwrap();
+        let note_start = tiff.order.u32(&note.value) as usize;
+        let note_end = note_start + note.count as usize;
+        let tail_start = note_end - original[note_start..note_end].iter().rev().take_while(|byte| **byte == 0).count();
+
+        let dir = TestDir::new();
+        let per_frame = 83_u32;
+        let frames = 4_u32;
+        let mut largest = 0;
+        for seq in 0..frames {
+            let mut record = gyro2_record(seq * per_frame, seq, per_frame as usize + 4);
+            if seq == 0 {
+                record.flags |= fsg2::FLAG_LENS_TABLE;
+                record.lens_table = Some(fsg2::LensTable { calib_focal_tenths_mm: 280, axis: [0, 18641, 37283, 49637, 55924], nodes: [[[1.0, -0.0148, 0.0052, -0.0098]; 3]; 5] });
+            }
+            let encoded = block(&fsg2::encode(&record), BLOCK_KIND_GYRO2);
+            largest = largest.max(encoded.len());
+            let at = tail_start + 64;
+            assert!(at + encoded.len() <= note_end, "block of {} bytes does not fit the {}-byte tail", encoded.len(), note_end - tail_start);
+            let mut frame = original.clone();
+            frame[at..at + encoded.len()].copy_from_slice(&encoded);
+            fs::write(dir.frame(seq + 1), frame).unwrap();
+        }
+        println!("zero tail {} bytes, largest block {} bytes", note_end - tail_start, largest);
+
+        let sequence = read_embedded_protobuf_sequence(&dir.frame(1)).unwrap();
+        println!("frames {} size {}x{} fps {:.3}", sequence.frame_count, sequence.width, sequence.height, sequence.fps);
+        let metadata = gyroflow_core::telemetry_parser::util::VideoMetadata {
+            width: sequence.width,
+            height: sequence.height,
+            fps: sequence.fps,
+            duration_s: sequence.frame_count as f64 / sequence.fps,
+            rotation: sequence.rotation,
+        };
+        let virtual_url = gyroflow_core::filesystem::path_to_url(&dir.0.join("t.jsonl").to_string_lossy());
+        let mut stream = std::io::Cursor::new(sequence.jsonl.as_slice());
+        let manager = gyroflow_core::StabilizationManager::default();
+        manager.load_video_file(&mut stream, sequence.jsonl.len(), &virtual_url, Some(metadata), true).unwrap();
+        let gyro = manager.gyro.read();
+        let file_metadata = gyro.file_metadata.read();
+        println!("raw_imu {} quaternions {} readout {:?} ms camera {:?}",
+            file_metadata.raw_imu.len(), gyro.quaternions.len(), file_metadata.frame_readout_time, file_metadata.camera_identifier);
+        assert_eq!(file_metadata.per_frame_time_offsets.len(), frames as usize);
+        assert_eq!(file_metadata.raw_imu.len(), (frames * per_frame + 4) as usize);
+        assert!(gyro.quaternions.values().all(|q| q.coords.iter().all(|c| c.is_finite())));
     }
 }

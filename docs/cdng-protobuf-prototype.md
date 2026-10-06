@@ -13,13 +13,14 @@ This fork lets the DaVinci Resolve OpenFX plugin read **Gyroflow Protobuf teleme
   |---|---|---|
   | 0 | 4 | magic `FSG2` (not `FPG2`, which another fp mod already uses in the same place) |
   | 4 | 1 | version, `1` |
-  | 5 | 1 | payload kind, `1` = serialized `Main` (other kinds are reserved, e.g. a compressed form) |
+  | 5 | 1 | payload kind: `1` = serialized `Main`; `2` = SIGMA fp gyro record (raw sensor counts, sample-position timing; layout and conversion in `common/src/fsg2.rs`) |
   | 6 | 2 | reserved, `0` |
   | 8 | 4 | payload length *n* |
   | 12 | *n* | payload |
   | 12+*n* | 4 | IEEE CRC-32 of bytes 0 .. 12+*n* |
 
   Every occurrence of the magic is checked for length and CRC; exactly one valid block per frame is required.
+- Kind 2 takes the frame size from `DefaultCropSize`, the frame rate from `FrameRate`, and exposure, ISO, aperture, focal length, focus distance and lens model from the frame's own EXIF. A take must use one payload kind throughout.
 - The first DNG in filename order contains both `Header` (camera and clip metadata) and `FrameMetadata`. Later DNGs contain `FrameMetadata`; if they repeat `Header`, it must match the first one.
 - Filenames end in numeric frame suffixes and form one gap-free sequence in a directory (for example, `shot_0001.dng`, `shot_0002.dng`). Protobuf `frame_number` values must be **1, 2, …, N** in that order, regardless of the filename's starting number. Each DNG must carry its own block or tag.
 - The plugin gets image dimensions and frame rate from the first Protobuf `Header`: `frame_width`, `frame_height`, and preferably `file_frame_rate` (falling back to `record_frame_rate`, then `sensor_frame_rate`). The count of sequence files and that frame rate determine clip duration.

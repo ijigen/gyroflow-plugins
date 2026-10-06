@@ -6,6 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{ Arc, atomic::AtomicBool };
 
 mod cdng;
+mod fsg2;
 
 pub use gyroflow_core::{ StabilizationManager, keyframes::*, stabilization::*, filesystem, gpu::* };
 pub use gyroflow_core;
