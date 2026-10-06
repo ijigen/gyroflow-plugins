@@ -31,6 +31,8 @@
 
 use gyroflow_core::telemetry_parser::gyroflow::gyroflow_proto;
 
+use crate::lensfit;
+
 pub const FMT_VERSION: u8 = 1;
 pub const HEADER_BYTES: usize = 48;
 
@@ -211,6 +213,9 @@ pub struct DngInfo {
     pub f_number: Option<f64>,
     pub focal_length_mm: Option<f64>,
     pub subject_distance_m: Option<f64>,
+    /// Green-plane kr0..kr3 of the frame's WarpRectilinear opcode: the camera's
+    /// distortion, already interpolated for this frame's focus.
+    pub warp_rectilinear: Option<[f64; 4]>,
 }
 
 /// Turns a take's kind 2 records, in file order, into Gyroflow Protobuf messages.
@@ -294,6 +299,10 @@ pub fn to_messages(frames: &[(Record, DngInfo)]) -> Result<Vec<gyroflow_proto::M
         }),
     };
 
+    // The take's lens table, normally on its first frame; frames without one in
+    // reach fall back to their own WarpRectilinear opcode.
+    let lens_table = frames.iter().find_map(|(record, _)| record.lens_table.as_ref());
+
     let mut next_global: u64 = 0;
     let mut messages = Vec::with_capacity(frames.len());
     for (index, (record, dng)) in frames.iter().enumerate() {
@@ -335,13 +344,7 @@ pub fn to_messages(frames: &[(Record, DngInfo)]) -> Result<Vec<gyroflow_proto::M
         }
         for (_, value) in level_iter { held_accel = value; }
 
-        let lens = gyroflow_proto::LensData {
-            focal_length_mm: dng.focal_length_mm.map(|v| v as f32),
-            f_number: dng.f_number.map(|v| v as f32),
-            focus_distance_mm: dng.subject_distance_m.map(|m| (m * 1000.0) as f32),
-            distortion: None,
-            ..Default::default()
-        };
+        let lens = lens_data(lens_table, record, dng, width, height);
         let frame = gyroflow_proto::FrameMetadata {
             start_timestamp_us: start,
             end_timestamp_us: start + record.readout_ns as f64 / 1000.0,
@@ -364,6 +367,39 @@ pub fn to_messages(frames: &[(Record, DngInfo)]) -> Result<Vec<gyroflow_proto::M
         });
     }
     Ok(messages)
+}
+
+/// One frame's lens: focal length, aperture, focus distance, and - when the
+/// camera's correction data reaches this frame - the camera matrix and fisheye
+/// coefficients fitted for this frame's focus, so breathing and distortion
+/// follow a focus pull.
+fn lens_data(table: Option<&LensTable>, record: &Record, dng: &DngInfo, width: u32, height: u32) -> gyroflow_proto::LensData {
+    let distance_mm = dng.subject_distance_m.map(|m| m * 1000.0);
+    let (kr, focal_mm) = match table {
+        Some(table) => (
+            lensfit::interpolate(&table.axis, &table.nodes, distance_mm),
+            lensfit::focal_mm(Some(table.calib_focal_tenths_mm), dng.focal_length_mm),
+        ),
+        None => (dng.warp_rectilinear, lensfit::focal_mm(None, dng.focal_length_mm)),
+    };
+    let mut lens = gyroflow_proto::LensData {
+        focal_length_mm: focal_mm.or(dng.focal_length_mm).map(|v| v as f32),
+        f_number: dng.f_number.map(|v| v as f32),
+        focus_distance_mm: distance_mm.map(|mm| mm as f32),
+        ..Default::default()
+    };
+    let fitted = focal_mm.zip(kr).and_then(|(focal_mm, kr)| {
+        lensfit::fit(kr, width, height, lensfit::focal_px(width, focal_mm, record.crop[2]))
+    });
+    if let Some((coefficients, fx)) = fitted {
+        let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
+        let fx = fx as f32;
+        lens.camera_intrinsic_matrix = vec![fx, 0.0, cx, 0.0, fx, cy, 0.0, 0.0, 1.0];
+        lens.distortion = Some(gyroflow_proto::lens_data::Distortion::OpencvFisheye(gyroflow_proto::OpenCvFisheye {
+            coefficients: coefficients.iter().map(|v| *v as f32).collect(),
+        }));
+    }
+    lens
 }
 
 fn level_counts(event: &Event) -> [i16; 3] {
@@ -580,6 +616,70 @@ mod tests {
         assert!(close(acc(0, 3), first_reading));
         assert!(close(acc(1, 0), first_reading));
         assert!(close(acc(1, 1), [0.0, 50.0 * g, 1000.0 * g]));
+    }
+
+    // The LUMIX S 40/F2's green plane (fpSup gyro/test_distfit.py).
+    fn lumix_40_table() -> LensTable {
+        let green = [
+            [0.987878098, 0.000230792, -0.001804660, 0.012710940],
+            [0.995612771, -0.003803673, -0.003186222, 0.011056404],
+            [0.999854447, -0.010596089, 0.003693395, 0.003874420],
+            [0.999856513, -0.016680599, 0.013089761, -0.003420052],
+            [0.999845119, -0.020184787, 0.018855619, -0.007281209],
+        ];
+        LensTable { calib_focal_tenths_mm: 400, axis: [0, 18641, 37283, 49637, 55924], nodes: green.map(|kr| [kr, kr, kr]) }
+    }
+
+    fn lens_of(message: &gyroflow_proto::Main) -> &gyroflow_proto::LensData {
+        &message.frame.as_ref().unwrap().lens[0]
+    }
+
+    fn fisheye(lens: &gyroflow_proto::LensData) -> Vec<f32> {
+        match &lens.distortion {
+            Some(gyroflow_proto::lens_data::Distortion::OpencvFisheye(c)) => c.coefficients.clone(),
+            other => panic!("expected OpenCV fisheye, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lens_follows_a_focus_pull_from_the_first_frames_table() {
+        let mut first = record(0, 0, vec![[0, 0, 0]]);
+        first.flags |= FLAG_LENS_TABLE;
+        first.lens_table = Some(lumix_40_table());
+        first.crop[2] = 6000;
+        let mut second = record(1, 1, vec![[0, 0, 0]]);
+        second.crop[2] = 6000;
+        let at = |metres: Option<f64>| DngInfo { frame_size: Some((1936, 1090)), focal_length_mm: Some(40.0), subject_distance_m: metres, ..dng() };
+        let messages = to_messages(&[(first, at(None)), (second, at(Some(0.364)))]).unwrap();
+
+        // Golden values from fpSup's Python mirror of the camera's fit.
+        let infinity = lens_of(&messages[0]);
+        assert!((infinity.camera_intrinsic_matrix[0] as f64 - 2130.954872120334).abs() < 1e-2);
+        assert_eq!(infinity.camera_intrinsic_matrix[0], infinity.camera_intrinsic_matrix[4]);
+        assert_eq!((infinity.camera_intrinsic_matrix[2], infinity.camera_intrinsic_matrix[5]), (968.0, 545.0));
+        assert!((fisheye(infinity)[0] as f64 - 0.3434034356654717).abs() < 1e-6);
+        assert_eq!(infinity.focal_length_mm, Some(40.0));
+
+        let near = lens_of(&messages[1]);
+        assert!((near.camera_intrinsic_matrix[0] as f64 - 2156.792268728652).abs() < 1e-2);
+        assert!((fisheye(near)[0] as f64 - 0.2772084741693018).abs() < 1e-6);
+        assert!((near.focus_distance_mm.unwrap() - 364.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn without_a_table_each_frame_uses_its_own_warp_opcode() {
+        let opcode = DngInfo { warp_rectilinear: Some([1.000334, -0.01484, 0.00518, -0.009761]), ..dng() };
+        let messages = to_messages(&[(record(0, 0, vec![]), opcode)]).unwrap();
+        let lens = lens_of(&messages[0]);
+        assert_eq!(fisheye(lens).len(), 4);
+        // The breathing term rides on the 28 mm focal: 1920 x 28 / 35.9 x kr0.
+        let focal = 1920.0 * 28.0 / (35.9 * 5872.0 / 6000.0) * 1.000334;
+        assert!((lens.camera_intrinsic_matrix[0] as f64 - focal).abs() < 1e-2);
+
+        let plain = to_messages(&[(record(0, 0, vec![]), dng())]).unwrap();
+        let lens = lens_of(&plain[0]);
+        assert!(lens.distortion.is_none() && lens.camera_intrinsic_matrix.is_empty());
+        assert_eq!(lens.focal_length_mm, Some(28.0));
     }
 
     #[test]

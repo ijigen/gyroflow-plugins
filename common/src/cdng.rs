@@ -19,6 +19,7 @@ use crate::fsg2;
 const PROTOTYPE_TAG: u16 = 65000;
 const EXIF_IFD_TAG: u16 = 0x8769;
 const MAKER_NOTE_TAG: u16 = 0x927C;
+const OPCODE_LIST3_TAG: u16 = 0xC74E;
 /// Magic of the MakerNote telemetry block. Deliberately not
 /// "FPG2", which sigma-fp-supmod already uses in the same place with a
 /// different layout.
@@ -477,6 +478,9 @@ fn read_dng_info(tiff: &mut TiffReader, root: &[IfdEntry], exif: &[IfdEntry]) ->
         f_number: first(number(exif, 0x829D)),
         focal_length_mm: first(number(exif, 0x920A)),
         subject_distance_m: first(number(exif, 0x9206)),
+        warp_rectilinear: root.iter().find(|entry| entry.tag == OPCODE_LIST3_TAG)
+            .and_then(|entry| tiff.raw(entry).ok())
+            .and_then(|list| crate::lensfit::warp_rectilinear(&list)),
     }
 }
 
@@ -1096,7 +1100,15 @@ mod tests {
         let per_frame = 83;
         let frames = 5_u32;
         for seq in 0..frames {
-            let record = gyro2_record(seq * per_frame, seq, per_frame as usize + 4);
+            let mut record = gyro2_record(seq * per_frame, seq, per_frame as usize + 4);
+            if seq == 0 {
+                record.flags |= fsg2::FLAG_LENS_TABLE;
+                record.lens_table = Some(fsg2::LensTable {
+                    calib_focal_tenths_mm: 280,
+                    axis: [0, 18641, 37283, 49637, 55924],
+                    nodes: [[[1.0003, -0.0148, 0.0052, -0.0098]; 3]; 5],
+                });
+            }
             write_fp_like_frame(&dir.frame(seq + 1), block(&fsg2::encode(&record), BLOCK_KIND_GYRO2));
         }
         let sequence = read_embedded_protobuf_sequence(&dir.frame(1)).unwrap();
@@ -1126,6 +1138,21 @@ mod tests {
         assert!((readout_ms - 10.556).abs() < 1e-3, "{readout_ms}");
         assert!(!gyro.quaternions.is_empty());
         assert!(gyro.quaternions.values().all(|q| q.coords.iter().all(|c| c.is_finite())));
+        drop(file_metadata);
+        drop(gyro);
+        check_lens_reaches_core(&manager, frames as usize);
+    }
+
+    /// Each frame's fitted lens lands in gyroflow-core's per-frame lens
+    /// parameters, and a lens profile is synthesized for the take.
+    fn check_lens_reaches_core(manager: &gyroflow_core::StabilizationManager, frames: usize) {
+        let gyro = manager.gyro.read();
+        let file_metadata = gyro.file_metadata.read();
+        assert!(file_metadata.lens_profile.as_ref().is_some_and(|p| p["distortion_model"] == "opencv_fisheye"), "{:?}", file_metadata.lens_profile);
+        assert_eq!(file_metadata.lens_params.len(), frames);
+        let first = file_metadata.lens_params.values().next().unwrap();
+        assert_eq!(first.distortion_coefficients.len(), 4);
+        assert!(first.pixel_focal_length.is_some_and(|(fx, fy)| fx > 0.0 && fx == fy));
     }
 
     #[test]
@@ -1191,6 +1218,17 @@ mod tests {
             fs::write(dir.frame(seq + 1), frame).unwrap();
         }
         println!("zero tail {} bytes, largest block {} bytes", note_end - tail_start, largest);
+        let (_, source_dng) = read_frame(Path::new(&source)).unwrap_or_else(|_| {
+            // The untouched frame has no block, so read only its DNG metadata.
+            let mut tiff = TiffReader::open(Path::new(&source)).unwrap();
+            let root_offset = tiff.root_ifd_offset().unwrap();
+            let root = tiff.read_ifd(root_offset).unwrap();
+            let exif_offset = tiff.sub_ifd_offset(find_unique(&root, EXIF_IFD_TAG, "Exif").unwrap().unwrap(), "Exif").unwrap();
+            let exif = tiff.read_ifd(exif_offset).unwrap();
+            (FramePayload::Protobuf(vec![]), read_dng_info(&mut tiff, &root, &exif))
+        });
+        println!("source WarpRectilinear green {:?}, focus {:?} m, lens {:?}", source_dng.warp_rectilinear, source_dng.subject_distance_m, source_dng.lens_model);
+        assert!(source_dng.warp_rectilinear.is_some(), "a real fp frame carries WarpRectilinear");
 
         let sequence = read_embedded_protobuf_sequence(&dir.frame(1)).unwrap();
         println!("frames {} size {}x{} fps {:.3}", sequence.frame_count, sequence.width, sequence.height, sequence.fps);
@@ -1212,5 +1250,10 @@ mod tests {
         assert_eq!(file_metadata.per_frame_time_offsets.len(), frames as usize);
         assert_eq!(file_metadata.raw_imu.len(), (frames * per_frame + 4) as usize);
         assert!(gyro.quaternions.values().all(|q| q.coords.iter().all(|c| c.is_finite())));
+        let first = file_metadata.lens_params.values().next().cloned();
+        println!("lens params frame 1: {first:?}");
+        drop(file_metadata);
+        drop(gyro);
+        check_lens_reaches_core(&manager, frames as usize);
     }
 }
