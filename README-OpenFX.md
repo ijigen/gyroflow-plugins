@@ -18,13 +18,13 @@ Grab the archive for your OS from the [releases page](https://github.com/gyroflo
 
 ## MacOS
 
-Copy the `Gyroflow.ofx.bundle` from the archive into the `/Library/OFX/Plugins` directory.
+Copy the `fpSupGyroflow.ofx.bundle` from the archive into the `/Library/OFX/Plugins` directory.
 Create the directory if it doesn't exist yet.
-Then in Resolve, make sure to go to Preferences -> Video plugins and enable Gyroflow.ofx.bundle.
+Then in Resolve, make sure to go to Preferences -> Video plugins and enable fpSupGyroflow.ofx.bundle.
 
 ## Windows
 
-Copy the `Gyroflow.ofx.bundle` from the archive into the `C:\Program Files\Common Files\OFX\Plugins` folder.
+Copy the `fpSupGyroflow.ofx.bundle` from the archive into the `C:\Program Files\Common Files\OFX\Plugins` folder.
 Create the folder if it doesn't exist yet.
 
 ## For more detailed instructions, see the [docs](https://docs.gyroflow.xyz/app/video-editor-plugins/davinci-resolve-openfx#installation)

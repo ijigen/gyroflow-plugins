@@ -8,7 +8,7 @@ use gyroflow_plugin_base::parking_lot::{ Mutex, RwLock };
 use gyroflow_plugin_base::lru::LruCache;
 
 plugin_module!(
-    "xyz.gyroflow",
+    "io.github.ijigen.fpsup.gyroflow",
     ApiVersion(1),
     PluginVersion(1, 2),
     GyroflowPlugin::default
@@ -693,11 +693,11 @@ impl Execute for GyroflowPlugin {
                 }
 
                 let mut effect_properties: EffectDescriptor = effect.properties()?;
-                effect_properties.set_grouping("Warp")?;
+                effect_properties.set_grouping("fpSup")?;
 
-                effect_properties.set_label("Gyroflow")?;
-                effect_properties.set_short_label("Gyroflow")?;
-                effect_properties.set_long_label("Gyroflow")?;
+                effect_properties.set_label("Gyroflow (fpSup)")?;
+                effect_properties.set_short_label("Gyroflow (fpSup)")?;
+                effect_properties.set_long_label("Gyroflow (fpSup)")?;
 
                 effect_properties.set_supported_pixel_depths(&[BitDepth::Byte, BitDepth::Short, BitDepth::Float])?;
                 effect_properties.set_supported_contexts(&[ImageEffectContext::Filter])?;

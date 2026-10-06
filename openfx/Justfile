@@ -5,7 +5,7 @@ TargetDir := env_var_or_default("CARGO_TARGET_DIR", "target")
 [windows]
 release:
     cargo build --release
-    Copy-Item -Path "{{TargetDir}}\release\gyroflow_ofx.dll" -Destination "C:\Program Files\Common Files\OFX\Plugins\Gyroflow.ofx.bundle\Contents\Win64\Gyroflow.ofx" -Force
+    Copy-Item -Path "{{TargetDir}}\release\gyroflow_ofx.dll" -Destination "C:\Program Files\Common Files\OFX\Plugins\fpSupGyroflow.ofx.bundle\Contents\Win64\fpSupGyroflow.ofx" -Force
 
 [windows]
 deploy:
@@ -14,12 +14,12 @@ deploy:
 
     cargo build --profile deploy
     cd "{{TargetDir}}"
-    Remove-Item -Recurse -Force gyroflow-ofx-windows, Gyroflow-OpenFX-windows.zip -ErrorAction SilentlyContinue
-    New-Item -ItemType Directory -Path "gyroflow-ofx-windows/Gyroflow.ofx.bundle/Contents/Win64" -Force
-    cp "deploy/gyroflow_ofx.dll" "gyroflow-ofx-windows/Gyroflow.ofx.bundle/Contents/Win64/Gyroflow.ofx"
-    cp "{{justfile_directory()}}/res/Info.plist" "gyroflow-ofx-windows/Gyroflow.ofx.bundle/Contents/"
-    cp "{{justfile_directory()}}/../LICENSE" "gyroflow-ofx-windows/Gyroflow.ofx.bundle/Contents/"
-    cd gyroflow-ofx-windows ; 7z a ../Gyroflow-OpenFX-windows.zip .
+    Remove-Item -Recurse -Force gyroflow-ofx-windows, fpSupGyroflow-OpenFX-windows.zip -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Path "gyroflow-ofx-windows/fpSupGyroflow.ofx.bundle/Contents/Win64" -Force
+    cp "deploy/gyroflow_ofx.dll" "gyroflow-ofx-windows/fpSupGyroflow.ofx.bundle/Contents/Win64/fpSupGyroflow.ofx"
+    cp "{{justfile_directory()}}/res/Info.plist" "gyroflow-ofx-windows/fpSupGyroflow.ofx.bundle/Contents/"
+    cp "{{justfile_directory()}}/../LICENSE" "gyroflow-ofx-windows/fpSupGyroflow.ofx.bundle/Contents/"
+    cd gyroflow-ofx-windows ; 7z a ../fpSupGyroflow-OpenFX-windows.zip .
 
 [macos]
 deploy:
@@ -49,31 +49,31 @@ deploy:
     fi
 
     cd "{{TargetDir}}"
-    rm -Rf gyroflow-ofx-macos Gyroflow-OpenFX-macos.dmg
-    mkdir -p gyroflow-ofx-macos/Gyroflow.ofx.bundle/Contents/MacOS
+    rm -Rf gyroflow-ofx-macos fpSupGyroflow-OpenFX-macos.dmg
+    mkdir -p gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/MacOS
 
-    lipo {x86_64,aarch64}-apple-darwin/deploy/libgyroflow_ofx.dylib -create -output gyroflow-ofx-macos/Gyroflow.ofx.bundle/Contents/MacOS/Gyroflow.dylib
-    cp "{{justfile_directory()}}/res/Info.plist" gyroflow-ofx-macos/Gyroflow.ofx.bundle/Contents/
-    cp "{{justfile_directory()}}/../LICENSE"     gyroflow-ofx-macos/Gyroflow.ofx.bundle/Contents/
+    lipo {x86_64,aarch64}-apple-darwin/deploy/libgyroflow_ofx.dylib -create -output gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/MacOS/fpSupGyroflow.dylib
+    cp "{{justfile_directory()}}/res/Info.plist" gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/
+    cp "{{justfile_directory()}}/../LICENSE"     gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/
 
-    /usr/libexec/PlistBuddy -c "add CFBundleVersion string $version_short" gyroflow-ofx-macos/Gyroflow.ofx.bundle/Contents/Info.plist
-    /usr/libexec/PlistBuddy -c "add CFBundleShortVersionString string $version" gyroflow-ofx-macos/Gyroflow.ofx.bundle/Contents/Info.plist
+    /usr/libexec/PlistBuddy -c "add CFBundleVersion string $version_short" gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/Info.plist
+    /usr/libexec/PlistBuddy -c "add CFBundleShortVersionString string $version" gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/Info.plist
 
-    codesign -vvvv --strict --options=runtime --timestamp --force -s ${SIGNING_FINGERPRINT} gyroflow-ofx-macos/Gyroflow.ofx.bundle/Contents/MacOS/Gyroflow.dylib
-    mv gyroflow-ofx-macos/Gyroflow.ofx.bundle/Contents/MacOS/Gyroflow.dylib gyroflow-ofx-macos/Gyroflow.ofx.bundle/Contents/MacOS/Gyroflow.ofx
+    codesign -vvvv --strict --options=runtime --timestamp --force -s ${SIGNING_FINGERPRINT} gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/MacOS/fpSupGyroflow.dylib
+    mv gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/MacOS/fpSupGyroflow.dylib gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/MacOS/fpSupGyroflow.ofx
 
-    codesign -vvvv --deep --strict --options=runtime --timestamp --force -s ${SIGNING_FINGERPRINT} gyroflow-ofx-macos/Gyroflow.ofx.bundle
-    codesign -vvvv --deep --verify gyroflow-ofx-macos/Gyroflow.ofx.bundle
+    codesign -vvvv --deep --strict --options=runtime --timestamp --force -s ${SIGNING_FINGERPRINT} gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle
+    codesign -vvvv --deep --verify gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle
 
     pushd gyroflow-ofx-macos
-        zip -r ../Gyroflow-OpenFX-macos.zip Gyroflow.ofx.bundle
+        zip -r ../fpSupGyroflow-OpenFX-macos.zip fpSupGyroflow.ofx.bundle
     popd
 
     ln -sf /Library/OFX/Plugins "gyroflow-ofx-macos/"
-    hdiutil create "Gyroflow-OpenFX-macos.dmg" -volname "Gyroflow OpenFX plugin" -fs HFS+ -srcfolder "gyroflow-ofx-macos/" -ov -format UDZO -imagekey zlib-level=9
+    hdiutil create "fpSupGyroflow-OpenFX-macos.dmg" -volname "Gyroflow OpenFX plugin" -fs HFS+ -srcfolder "gyroflow-ofx-macos/" -ov -format UDZO -imagekey zlib-level=9
 
-    codesign -vvvv --strict --options=runtime --timestamp --force -s ${SIGNING_FINGERPRINT} "Gyroflow-OpenFX-macos.dmg"
-    codesign -vvvv --deep --verify "Gyroflow-OpenFX-macos.dmg"
+    codesign -vvvv --strict --options=runtime --timestamp --force -s ${SIGNING_FINGERPRINT} "fpSupGyroflow-OpenFX-macos.dmg"
+    codesign -vvvv --deep --verify "fpSupGyroflow-OpenFX-macos.dmg"
 
 [linux]
 deploy:
@@ -82,9 +82,9 @@ deploy:
 
     cargo build --profile deploy
     cd "{{TargetDir}}"
-    rm -Rf gyroflow-ofx-linux Gyroflow-OpenFX-linux.zip
-    mkdir -p gyroflow-ofx-linux/Gyroflow.ofx.bundle/Contents/Linux-x86-64
-    cp deploy/libgyroflow_ofx.so gyroflow-ofx-linux/Gyroflow.ofx.bundle/Contents/Linux-x86-64/Gyroflow.ofx
-    cp "{{justfile_directory()}}/res/Info.plist" gyroflow-ofx-linux/Gyroflow.ofx.bundle/Contents/
-    cp "{{justfile_directory()}}/../LICENSE"     gyroflow-ofx-linux/Gyroflow.ofx.bundle/Contents/
-    cd gyroflow-ofx-linux && zip -r ../Gyroflow-OpenFX-linux.zip .
+    rm -Rf gyroflow-ofx-linux fpSupGyroflow-OpenFX-linux.zip
+    mkdir -p gyroflow-ofx-linux/fpSupGyroflow.ofx.bundle/Contents/Linux-x86-64
+    cp deploy/libgyroflow_ofx.so gyroflow-ofx-linux/fpSupGyroflow.ofx.bundle/Contents/Linux-x86-64/fpSupGyroflow.ofx
+    cp "{{justfile_directory()}}/res/Info.plist" gyroflow-ofx-linux/fpSupGyroflow.ofx.bundle/Contents/
+    cp "{{justfile_directory()}}/../LICENSE"     gyroflow-ofx-linux/fpSupGyroflow.ofx.bundle/Contents/
+    cd gyroflow-ofx-linux && zip -r ../fpSupGyroflow-OpenFX-linux.zip .

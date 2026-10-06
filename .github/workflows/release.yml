@@ -55,8 +55,8 @@ jobs:
         run: |
           just install-deps
           just deploy
-          xcrun notarytool submit --wait --apple-id ${{ secrets.MACOS_ACCOUNT_USER }} --team-id ${{ secrets.MACOS_TEAM }} --password ${{ secrets.MACOS_ACCOUNT_PASS }} ${{ github.workspace }}/target/Gyroflow-OpenFX-macos.dmg
-          xcrun stapler staple --verbose ${{ github.workspace }}/target/Gyroflow-OpenFX-macos.dmg
+          xcrun notarytool submit --wait --apple-id ${{ secrets.MACOS_ACCOUNT_USER }} --team-id ${{ secrets.MACOS_TEAM }} --password ${{ secrets.MACOS_ACCOUNT_PASS }} ${{ github.workspace }}/target/fpSupGyroflow-OpenFX-macos.dmg
+          xcrun stapler staple --verbose ${{ github.workspace }}/target/fpSupGyroflow-OpenFX-macos.dmg
           xcrun notarytool submit --wait --apple-id ${{ secrets.MACOS_ACCOUNT_USER }} --team-id ${{ secrets.MACOS_TEAM }} --password ${{ secrets.MACOS_ACCOUNT_PASS }} ${{ github.workspace }}/target/Gyroflow-Adobe-macos.dmg
           xcrun stapler staple --verbose ${{ github.workspace }}/target/Gyroflow-Adobe-macos.dmg
 
@@ -82,8 +82,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: ${{ matrix.targets.type != 'macos' }}
         with:
-          name: Gyroflow-OpenFX-${{ matrix.targets.type }}
-          path: target/Gyroflow-OpenFX*
+          name: fpSupGyroflow-OpenFX-${{ matrix.targets.type }}
+          path: target/fpSupGyroflow-OpenFX*
       - uses: actions/upload-artifact@v4
         if: ${{ matrix.targets.type != 'macos' }}
         with:
@@ -97,8 +97,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: ${{ matrix.targets.type == 'macos' }}
         with:
-          name: Gyroflow-OpenFX-${{ matrix.targets.type }}
-          path: target/Gyroflow-OpenFX-macos.dmg
+          name: fpSupGyroflow-OpenFX-${{ matrix.targets.type }}
+          path: target/fpSupGyroflow-OpenFX-macos.dmg
       - uses: actions/upload-artifact@v4
         if: ${{ matrix.targets.type == 'macos' }}
         with:
@@ -108,8 +108,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: ${{ matrix.targets.type == 'macos' }}
         with:
-          name: Gyroflow-OpenFX-${{ matrix.targets.type }}-zip
-          path: target/Gyroflow-OpenFX-macos.zip
+          name: fpSupGyroflow-OpenFX-${{ matrix.targets.type }}-zip
+          path: target/fpSupGyroflow-OpenFX-macos.zip
       - uses: actions/upload-artifact@v4
         if: ${{ matrix.targets.type == 'macos' }}
         with:
