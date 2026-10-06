@@ -1292,6 +1292,10 @@ mod tests {
         println!("raw_imu {} over {:.3} s = {:.1} Hz, max |gyro| {:.2} deg/s, frame offsets {}, quaternions {}, readout {:?} ms",
             imu.len(), span_s, (imu.len().saturating_sub(1)) as f64 / span_s.max(1e-9), max_dps,
             md.per_frame_time_offsets.len(), gyro.quaternions.len(), md.frame_readout_time);
+        let first_lens = md.lens_params.values().next().cloned();
+        println!("lens params first: {:?}", first_lens.map(|l| (l.focal_length, l.pixel_focal_length, l.distortion_coefficients, l.focus_distance)));
+        let accel = imu.iter().filter_map(|s| s.accl).find(|a| a.iter().any(|v| *v != 0.0));
+        println!("first nonzero accel (m/s^2, gyro axes): {accel:?}");
         assert_eq!(md.per_frame_time_offsets.len(), sequence.frame_count);
         assert!(gyro.quaternions.values().all(|q| q.coords.iter().all(|c| c.is_finite())));
     }
