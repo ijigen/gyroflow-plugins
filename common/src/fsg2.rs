@@ -62,8 +62,12 @@ const PIXEL_PITCH_NM: u32 = 5983;
 const STANDARD_GRAVITY: f64 = 9.80665;
 
 /// Constant from the frame hook to the readout of the first sensor row, in
-/// microseconds. Not measured yet; until it is, frames are placed at the hook.
-pub const HOOK_TO_READOUT_US: f64 = 0.0;
+/// microseconds: the first row is read out this long before the hook runs.
+/// Measured 2026-10-07 by matching the frames' optical-flow rotation against
+/// the gyro (A001_044 FHD 59.94p, readout 10.556 ms: -13.28 ms; A001_042 OG3K
+/// 29.97p, readout 12.435 ms: -13.42 ms; both exposure 4 ms, yaw correlation
+/// 0.97 and 0.9996).
+pub const HOOK_TO_READOUT_US: f64 = -13_350.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Event {
@@ -562,7 +566,7 @@ mod tests {
         let messages = to_messages(&frames).unwrap();
         let frame = messages[0].frame.as_ref().unwrap();
         let period_us = PERIOD_PS as f64 / 1e6;
-        assert!((frame.start_timestamp_us - 102.0 * period_us).abs() < 1e-6);
+        assert!((frame.start_timestamp_us - (102.0 * period_us + HOOK_TO_READOUT_US)).abs() < 1e-6);
         assert!((frame.end_timestamp_us - frame.start_timestamp_us - 21_325.0).abs() < 1e-6);
         assert!((frame.imu[3].sample_timestamp_us.unwrap() - 103.0 * period_us).abs() < 1e-6);
         let dps = 131.0 * GSCALE as f64 * 180.0 / std::f64::consts::PI;
@@ -593,7 +597,8 @@ mod tests {
         let period_us = PERIOD_PS as f64 / 1e6;
         let first_of_frame_2 = messages[1].frame.as_ref().unwrap().imu[0].sample_timestamp_us.unwrap();
         assert!((first_of_frame_2 - 10.0 * period_us).abs() < 1e-6);
-        assert!(messages[2].frame.as_ref().unwrap().start_timestamp_us > 0.0);
+        let start = |k: usize| messages[k].frame.as_ref().unwrap().start_timestamp_us;
+        assert!(start(1) < start(2) && start(2) < start(3), "a lost block still moves the timeline on");
         assert!(messages.iter().skip(1).all(|m| m.header.is_none()));
     }
 
