@@ -1226,6 +1226,7 @@ dependencies = [
 name = "gyroflow-plugin-base"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "fastrand",
  "gyroflow-core",
  "itertools 0.15.0",

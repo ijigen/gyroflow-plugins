@@ -1,9 +1,10 @@
 //! Experimental CinemaDNG carrier for Gyroflow Protobuf telemetry.
 //!
-//! This reader recognizes a private IFD0 tag (65000) containing one serialized
-//! `gyroflow_proto::Main` message per DNG frame. The tag assignment is a
-//! prototype convention, not a CinemaDNG or DNG standard. Only TIFF metadata
-//! and the bounded tag payload are read; image strips/tiles are never decoded.
+//! Each DNG frame carries one serialized `gyroflow_proto::Main` message, either
+//! in a framed block inside the unused tail of the MakerNote (the carrier the
+//! SIGMA fp writer uses) or in the older prototype IFD0 tag 65000. Both are
+//! local conventions, not CinemaDNG or DNG standards. Only TIFF metadata and
+//! the bounded payload are read; image strips/tiles are never decoded.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -14,6 +15,16 @@ use gyroflow_core::telemetry_parser::gyroflow::{gyroflow_proto, proto_json};
 use prost::Message;
 
 const PROTOTYPE_TAG: u16 = 65000;
+const EXIF_IFD_TAG: u16 = 0x8769;
+const MAKER_NOTE_TAG: u16 = 0x927C;
+/// Magic of the MakerNote telemetry block. Deliberately not
+/// "FPG2", which sigma-fp-supmod already uses in the same place with a
+/// different layout.
+const MAKER_NOTE_MAGIC: &[u8; 4] = b"FSG2";
+const BLOCK_VERSION: u8 = 1;
+const BLOCK_KIND_PROTOBUF: u8 = 1;
+const BLOCK_HEADER_BYTES: usize = 12;
+const MAX_MAKER_NOTE_BYTES: usize = 1024 * 1024;
 const MAX_PROTO_BYTES: usize = 4 * 1024 * 1024;
 const MAX_JSONL_BYTES: usize = 512 * 1024 * 1024;
 const MAX_FRAMES: usize = 1_000_000;
@@ -72,7 +83,7 @@ pub fn read_embedded_protobuf_sequence(path: &Path) -> Result<SequenceData, Stri
     let mut clip_properties = None;
 
     for (index, frame_path) in paths.iter().enumerate() {
-        let payload = read_private_tag(frame_path)
+        let payload = read_frame_payload(frame_path)
             .map_err(|error| format!("{}: {error}", frame_path.display()))?;
         let main = gyroflow_proto::Main::decode(payload.as_slice())
             .map_err(|error| format!("{}: invalid Gyroflow Protobuf: {error}", frame_path.display()))?;
@@ -211,65 +222,203 @@ fn read_exact_at(file: &mut File, file_len: u64, offset: u64, out: &mut [u8]) ->
     file.read_exact(out).map_err(|error| error.to_string())
 }
 
-fn read_private_tag(path: &Path) -> Result<Vec<u8>, String> {
-    let mut file = File::open(path).map_err(|error| error.to_string())?;
-    let file_len = file.metadata().map_err(|error| error.to_string())?.len();
-    let mut header = [0_u8; 8];
-    read_exact_at(&mut file, file_len, 0, &mut header)?;
-    let byte_order = if &header[..2] == b"II" {
-        ByteOrder::Little
-    } else if &header[..2] == b"MM" {
-        ByteOrder::Big
-    } else {
-        return Err("not a TIFF/DNG file".to_owned());
-    };
-    match byte_order.u16(&header[2..4]) {
-        42 => {}
-        43 => return Err("BigTIFF is not supported".to_owned()),
-        _ => return Err("not a classic TIFF/DNG file".to_owned()),
-    }
-    let ifd_offset = u64::from(byte_order.u32(&header[4..8]));
-    let mut count_bytes = [0_u8; 2];
-    read_exact_at(&mut file, file_len, ifd_offset, &mut count_bytes)?;
-    let entry_count = u64::from(byte_order.u16(&count_bytes));
-    if entry_count > MAX_IFD_ENTRIES {
-        return Err("TIFF IFD has too many entries".to_owned());
-    }
-    let entries_offset = ifd_offset.checked_add(2).ok_or("TIFF IFD offset overflow")?;
-    let entries_len = entry_count.checked_mul(12).ok_or("TIFF IFD length overflow")?;
-    if entries_offset.checked_add(entries_len).and_then(|end| end.checked_add(4)).is_none_or(|end| end > file_len) {
-        return Err("TIFF IFD exceeds file bounds".to_owned());
+/// One IFD entry as stored on disk; `value` holds the 4-byte value/offset field.
+struct IfdEntry {
+    tag: u16,
+    kind: u16,
+    count: u32,
+    value: [u8; 4],
+}
+
+/// Minimal bounds-checked reader for the classic TIFF structures this module needs.
+struct TiffReader {
+    file: File,
+    file_len: u64,
+    order: ByteOrder,
+}
+
+impl TiffReader {
+    fn open(path: &Path) -> Result<Self, String> {
+        let mut file = File::open(path).map_err(|error| error.to_string())?;
+        let file_len = file.metadata().map_err(|error| error.to_string())?.len();
+        let mut header = [0_u8; 8];
+        read_exact_at(&mut file, file_len, 0, &mut header)?;
+        let order = if &header[..2] == b"II" {
+            ByteOrder::Little
+        } else if &header[..2] == b"MM" {
+            ByteOrder::Big
+        } else {
+            return Err("not a TIFF/DNG file".to_owned());
+        };
+        match order.u16(&header[2..4]) {
+            42 => {}
+            43 => return Err("BigTIFF is not supported".to_owned()),
+            _ => return Err("not a classic TIFF/DNG file".to_owned()),
+        }
+        Ok(Self { file, file_len, order })
     }
 
-    let mut found = None;
-    for index in 0..entry_count {
-        let mut entry = [0_u8; 12];
-        read_exact_at(&mut file, file_len, entries_offset + index * 12, &mut entry)?;
-        if byte_order.u16(&entry[..2]) != PROTOTYPE_TAG {
-            continue;
-        }
-        if found.is_some() {
-            return Err("duplicate experimental Protobuf tag in IFD0".to_owned());
-        }
-        let kind = byte_order.u16(&entry[2..4]);
-        if kind != 1 && kind != 7 {
-            return Err("experimental Protobuf tag must be TIFF BYTE or UNDEFINED".to_owned());
-        }
-        let count = usize::try_from(byte_order.u32(&entry[4..8]))
-            .map_err(|_| "Protobuf tag payload length is too large".to_owned())?;
-        if count == 0 || count > MAX_PROTO_BYTES {
-            return Err("Protobuf tag payload length is invalid or too large".to_owned());
-        }
-        let mut payload = vec![0_u8; count];
-        if count <= 4 {
-            payload.copy_from_slice(&entry[8..8 + count]);
-        } else {
-            let offset = u64::from(byte_order.u32(&entry[8..12]));
-            read_exact_at(&mut file, file_len, offset, &mut payload)?;
-        }
-        found = Some(payload);
+    fn root_ifd_offset(&mut self) -> Result<u64, String> {
+        let mut bytes = [0_u8; 4];
+        read_exact_at(&mut self.file, self.file_len, 4, &mut bytes)?;
+        Ok(u64::from(self.order.u32(&bytes)))
     }
-    found.ok_or_else(|| "experimental Protobuf tag 65000 is absent from IFD0".to_owned())
+
+    fn read_ifd(&mut self, ifd_offset: u64) -> Result<Vec<IfdEntry>, String> {
+        let mut count_bytes = [0_u8; 2];
+        read_exact_at(&mut self.file, self.file_len, ifd_offset, &mut count_bytes)?;
+        let entry_count = u64::from(self.order.u16(&count_bytes));
+        if entry_count > MAX_IFD_ENTRIES {
+            return Err("TIFF IFD has too many entries".to_owned());
+        }
+        let entries_offset = ifd_offset.checked_add(2).ok_or("TIFF IFD offset overflow")?;
+        let entries_len = entry_count.checked_mul(12).ok_or("TIFF IFD length overflow")?;
+        if entries_offset.checked_add(entries_len).and_then(|end| end.checked_add(4)).is_none_or(|end| end > self.file_len) {
+            return Err("TIFF IFD exceeds file bounds".to_owned());
+        }
+        let mut raw = vec![0_u8; entries_len as usize];
+        read_exact_at(&mut self.file, self.file_len, entries_offset, &mut raw)?;
+        Ok(raw.chunks_exact(12).map(|entry| IfdEntry {
+            tag: self.order.u16(&entry[..2]),
+            kind: self.order.u16(&entry[2..4]),
+            count: self.order.u32(&entry[4..8]),
+            value: entry[8..12].try_into().expect("four bytes"),
+        }).collect())
+    }
+
+    /// Bytes of a BYTE/UNDEFINED entry, inline or out of line, at most `max` long.
+    fn byte_data(&mut self, entry: &IfdEntry, max: usize, what: &str) -> Result<Vec<u8>, String> {
+        if entry.kind != 1 && entry.kind != 7 {
+            return Err(format!("{what} must be TIFF BYTE or UNDEFINED"));
+        }
+        let count = usize::try_from(entry.count)
+            .map_err(|_| format!("{what} length is too large"))?;
+        if count == 0 || count > max {
+            return Err(format!("{what} length is invalid or too large"));
+        }
+        let mut data = vec![0_u8; count];
+        if count <= 4 {
+            data.copy_from_slice(&entry.value[..count]);
+        } else {
+            let offset = u64::from(self.order.u32(&entry.value));
+            read_exact_at(&mut self.file, self.file_len, offset, &mut data)?;
+        }
+        Ok(data)
+    }
+
+    /// Offset stored in a single LONG or IFD entry that points to a sub-IFD.
+    fn sub_ifd_offset(&self, entry: &IfdEntry, what: &str) -> Result<u64, String> {
+        if (entry.kind != 4 && entry.kind != 13) || entry.count != 1 {
+            return Err(format!("{what} must be a single LONG or IFD offset"));
+        }
+        Ok(u64::from(self.order.u32(&entry.value)))
+    }
+}
+
+fn find_unique<'a>(entries: &'a [IfdEntry], tag: u16, what: &str) -> Result<Option<&'a IfdEntry>, String> {
+    let mut matches = entries.iter().filter(|entry| entry.tag == tag);
+    let first = matches.next();
+    if matches.next().is_some() {
+        return Err(format!("duplicate {what} in IFD"));
+    }
+    Ok(first)
+}
+
+/// Read the serialized `gyroflow_proto::Main` carried by one DNG frame.
+///
+/// The primary carrier is a framed block in the unused zero tail of the
+/// MakerNote (see `parse_makernote_block`). The older prototype carrier, IFD0
+/// tag 65000, is still accepted and takes precedence when present.
+fn read_frame_payload(path: &Path) -> Result<Vec<u8>, String> {
+    let mut tiff = TiffReader::open(path)?;
+    let root_offset = tiff.root_ifd_offset()?;
+    let root = tiff.read_ifd(root_offset)?;
+
+    if let Some(entry) = find_unique(&root, PROTOTYPE_TAG, "experimental Protobuf tag")? {
+        return tiff.byte_data(entry, MAX_PROTO_BYTES, "experimental Protobuf tag payload");
+    }
+
+    let exif_entry = find_unique(&root, EXIF_IFD_TAG, "Exif IFD pointer")?
+        .ok_or_else(|| "no telemetry: IFD0 has neither tag 65000 nor an Exif IFD".to_owned())?;
+    let exif_offset = tiff.sub_ifd_offset(exif_entry, "Exif IFD pointer")?;
+    let exif = tiff.read_ifd(exif_offset)?;
+    let maker_note = find_unique(&exif, MAKER_NOTE_TAG, "MakerNote")?
+        .ok_or_else(|| "no telemetry: Exif IFD has no MakerNote".to_owned())?;
+    let maker_note = tiff.byte_data(maker_note, MAX_MAKER_NOTE_BYTES, "MakerNote")?;
+    parse_makernote_block(&maker_note).map(<[u8]>::to_vec)
+}
+
+/// Find the telemetry block inside a MakerNote and return its payload.
+///
+/// Block layout (all integers little-endian, independent of the TIFF byte
+/// order, because the camera writes it as raw memory):
+///
+/// ```text
+///   0  magic           4 bytes, MAKER_NOTE_MAGIC
+///   4  version         u8, 1
+///   5  payload kind    u8, 1 = serialized gyroflow_proto::Main
+///   6  reserved        u16, 0
+///   8  payload length  u32
+///  12  payload
+///  12+len crc32        u32, IEEE CRC-32 of bytes 0 .. 12+len
+/// ```
+///
+/// The block lives in the zero-filled tail the camera leaves at the end of
+/// the declared MakerNote range, so it is carried along by anything that
+/// copies the MakerNote, without adding IFD entries. Every candidate magic
+/// must pass the length and CRC checks; exactly one valid block is required.
+fn parse_makernote_block(maker_note: &[u8]) -> Result<&[u8], String> {
+    let mut found: Option<&[u8]> = None;
+    let mut rejected = None;
+    let mut start = 0;
+    while let Some(position) = find_bytes(&maker_note[start..], MAKER_NOTE_MAGIC) {
+        let at = start + position;
+        start = at + 1;
+        match parse_block_at(maker_note, at) {
+            Ok(payload) => {
+                if found.is_some() {
+                    return Err("more than one telemetry block in MakerNote".to_owned());
+                }
+                found = Some(payload);
+            }
+            Err(error) => rejected = Some(error),
+        }
+    }
+    match (found, rejected) {
+        (Some(payload), _) => Ok(payload),
+        (None, Some(error)) => Err(format!("invalid telemetry block in MakerNote: {error}")),
+        (None, None) => Err("no telemetry block in MakerNote".to_owned()),
+    }
+}
+
+fn parse_block_at(data: &[u8], at: usize) -> Result<&[u8], String> {
+    let header = data.get(at..at + BLOCK_HEADER_BYTES).ok_or("truncated block header")?;
+    let version = header[4];
+    let kind = header[5];
+    if version != BLOCK_VERSION {
+        return Err(format!("unsupported block version {version}"));
+    }
+    if header[6..8] != [0, 0] {
+        return Err("reserved block bytes are not zero".to_owned());
+    }
+    let length = u32::from_le_bytes(header[8..12].try_into().expect("four bytes")) as usize;
+    if length == 0 || length > MAX_PROTO_BYTES {
+        return Err("block payload length is invalid or too large".to_owned());
+    }
+    let payload_end = at + BLOCK_HEADER_BYTES + length;
+    let stored_crc = data.get(payload_end..payload_end + 4).ok_or("block exceeds MakerNote")?;
+    let stored_crc = u32::from_le_bytes(stored_crc.try_into().expect("four bytes"));
+    if crc32fast::hash(&data[at..payload_end]) != stored_crc {
+        return Err("block CRC mismatch".to_owned());
+    }
+    if kind != BLOCK_KIND_PROTOBUF {
+        return Err(format!("unsupported block payload kind {kind}"));
+    }
+    Ok(&data[at + BLOCK_HEADER_BYTES..payload_end])
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|window| window == needle)
 }
 
 #[cfg(test)]
@@ -339,6 +488,66 @@ mod tests {
         put_u32(&mut bytes, 0);
         bytes.extend_from_slice(&payload);
         fs::write(path, bytes).unwrap();
+    }
+
+    fn block(payload: &[u8], kind: u8) -> Vec<u8> {
+        let mut out = MAKER_NOTE_MAGIC.to_vec();
+        out.extend_from_slice(&[BLOCK_VERSION, kind, 0, 0]);
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        let crc = crc32fast::hash(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// A MakerNote shaped like the fp's: vendor data, then a zero tail that
+    /// holds the given blocks with zero padding around each.
+    fn maker_note_with(blocks: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = b"SIGMA\0\0\0Ver.5.02".to_vec();
+        out.extend((0..512_u32).map(|n| (n * 37 + 11) as u8));
+        out.extend_from_slice(&[0; 300]);
+        for block in blocks {
+            out.extend_from_slice(block);
+            out.extend_from_slice(&[0; 64]);
+        }
+        out.extend_from_slice(&[0; 200]);
+        out
+    }
+
+    fn write_dng_maker_note(path: &Path, maker_note: &[u8], order: ByteOrder) {
+        let mut bytes = Vec::new();
+        let put_u16 = |out: &mut Vec<u8>, n: u16| match order {
+            ByteOrder::Little => out.extend_from_slice(&n.to_le_bytes()),
+            ByteOrder::Big => out.extend_from_slice(&n.to_be_bytes()),
+        };
+        let put_u32 = |out: &mut Vec<u8>, n: u32| match order {
+            ByteOrder::Little => out.extend_from_slice(&n.to_le_bytes()),
+            ByteOrder::Big => out.extend_from_slice(&n.to_be_bytes()),
+        };
+        bytes.extend_from_slice(match order { ByteOrder::Little => b"II", ByteOrder::Big => b"MM" });
+        put_u16(&mut bytes, 42);
+        put_u32(&mut bytes, 8);
+        // IFD0 at 8: one Exif IFD pointer.
+        put_u16(&mut bytes, 1);
+        put_u16(&mut bytes, EXIF_IFD_TAG);
+        put_u16(&mut bytes, 4);
+        put_u32(&mut bytes, 1);
+        put_u32(&mut bytes, 26);
+        put_u32(&mut bytes, 0);
+        // Exif IFD at 26: one MakerNote entry whose data starts at 44.
+        put_u16(&mut bytes, 1);
+        put_u16(&mut bytes, MAKER_NOTE_TAG);
+        put_u16(&mut bytes, 7);
+        put_u32(&mut bytes, maker_note.len() as u32);
+        put_u32(&mut bytes, 44);
+        put_u32(&mut bytes, 0);
+        bytes.extend_from_slice(maker_note);
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn write_maker_note_frame(path: &Path, main: &gyroflow_proto::Main, order: ByteOrder) {
+        let note = maker_note_with(&[block(&main.encode_to_vec(), BLOCK_KIND_PROTOBUF)]);
+        write_dng_maker_note(path, &note, order);
     }
 
     #[test]
@@ -508,5 +717,145 @@ mod tests {
         bytes[8..10].copy_from_slice(&((MAX_IFD_ENTRIES + 1) as u16).to_le_bytes());
         fs::write(&path, bytes).unwrap();
         assert!(read_embedded_protobuf_sequence(&path).unwrap_err().contains("too many entries"));
+    }
+
+    #[test]
+    fn reads_sequence_from_maker_note_tail_in_either_tiff_order() {
+        let dir = TestDir::new();
+        write_maker_note_frame(&dir.frame(1), &message(1, true), ByteOrder::Little);
+        write_maker_note_frame(&dir.frame(2), &message(2, false), ByteOrder::Big);
+        let sequence = read_embedded_protobuf_sequence(&dir.frame(1)).unwrap();
+        assert_eq!(sequence.frame_count, 2);
+        assert_eq!((sequence.width, sequence.height), (1920, 1080));
+        let lines = sequence.jsonl.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()).count();
+        assert_eq!(lines, 2);
+    }
+
+    #[test]
+    fn maker_note_and_tag_carriers_give_identical_streams() {
+        let tag_dir = TestDir::new();
+        let note_dir = TestDir::new();
+        for (number, header) in [(1, true), (2, false)] {
+            write_dng(&tag_dir.frame(number), &message(number, header), ByteOrder::Little, 7);
+            write_maker_note_frame(&note_dir.frame(number), &message(number, header), ByteOrder::Little);
+        }
+        let from_tag = read_embedded_protobuf_sequence(&tag_dir.frame(1)).unwrap();
+        let from_note = read_embedded_protobuf_sequence(&note_dir.frame(1)).unwrap();
+        assert_eq!(from_tag.jsonl, from_note.jsonl);
+    }
+
+    #[test]
+    fn core_consumes_maker_note_sequence() {
+        let dir = TestDir::new();
+        let mut first = message(1, true);
+        first.frame.as_mut().unwrap().start_timestamp_us = 1_000_000.0;
+        first.frame.as_mut().unwrap().end_timestamp_us = 1_005_000.0;
+        let mut second = message(2, false);
+        second.frame.as_mut().unwrap().start_timestamp_us = 1_041_708.0;
+        second.frame.as_mut().unwrap().end_timestamp_us = 1_046_708.0;
+        write_maker_note_frame(&dir.frame(1), &first, ByteOrder::Little);
+        write_maker_note_frame(&dir.frame(2), &second, ByteOrder::Little);
+
+        let sequence = read_embedded_protobuf_sequence(&dir.frame(1)).unwrap();
+        let metadata = gyroflow_core::telemetry_parser::util::VideoMetadata {
+            width: sequence.width,
+            height: sequence.height,
+            fps: sequence.fps,
+            duration_s: sequence.frame_count as f64 / sequence.fps,
+            rotation: sequence.rotation,
+        };
+        let virtual_path = dir.0.join("embedded-telemetry.jsonl");
+        let virtual_url = gyroflow_core::filesystem::path_to_url(&virtual_path.to_string_lossy());
+        let mut stream = std::io::Cursor::new(sequence.jsonl.as_slice());
+        let manager = gyroflow_core::StabilizationManager::default();
+        manager.load_video_file(&mut stream, sequence.jsonl.len(), &virtual_url, Some(metadata), true).unwrap();
+        assert_eq!(manager.gyro.read().file_metadata.read().per_frame_time_offsets.len(), 2);
+    }
+
+    #[test]
+    fn maker_note_block_crc_mismatch_is_rejected() {
+        let mut bad = block(&message(1, true).encode_to_vec(), BLOCK_KIND_PROTOBUF);
+        let last_payload_byte = bad.len() - 5;
+        bad[last_payload_byte] ^= 0xFF;
+        let error = parse_makernote_block(&maker_note_with(&[bad])).unwrap_err();
+        assert!(error.contains("CRC mismatch"), "{error}");
+    }
+
+    #[test]
+    fn stray_magic_in_vendor_data_does_not_hide_the_real_block() {
+        let real = block(&message(1, true).encode_to_vec(), BLOCK_KIND_PROTOBUF);
+        let mut note = b"vendor FSG2 text that is not a block ".to_vec();
+        note.extend(maker_note_with(&[real.clone()]));
+        assert_eq!(parse_makernote_block(&note).unwrap(), &real[BLOCK_HEADER_BYTES..real.len() - 4]);
+    }
+
+    #[test]
+    fn two_valid_maker_note_blocks_are_ambiguous() {
+        let one = block(&message(1, true).encode_to_vec(), BLOCK_KIND_PROTOBUF);
+        let two = block(&message(2, false).encode_to_vec(), BLOCK_KIND_PROTOBUF);
+        let error = parse_makernote_block(&maker_note_with(&[one, two])).unwrap_err();
+        assert!(error.contains("more than one"), "{error}");
+    }
+
+    #[test]
+    fn maker_note_without_block_and_unknown_kind_are_reported() {
+        let error = parse_makernote_block(&maker_note_with(&[])).unwrap_err();
+        assert!(error.contains("no telemetry block"), "{error}");
+        let compressed = block(b"future compressed payload", 2);
+        let error = parse_makernote_block(&maker_note_with(&[compressed])).unwrap_err();
+        assert!(error.contains("unsupported block payload kind 2"), "{error}");
+    }
+
+    #[test]
+    fn block_running_past_maker_note_end_is_rejected() {
+        let mut truncated = block(&message(1, true).encode_to_vec(), BLOCK_KIND_PROTOBUF);
+        truncated.truncate(truncated.len() - 2);
+        let error = parse_makernote_block(&truncated).unwrap_err();
+        assert!(error.contains("exceeds MakerNote"), "{error}");
+    }
+
+    #[test]
+    fn frame_without_any_carrier_explains_what_is_missing() {
+        let dir = TestDir::new();
+        write_dng_maker_note(&dir.frame(1), &maker_note_with(&[]), ByteOrder::Little);
+        let error = read_embedded_protobuf_sequence(&dir.frame(1)).unwrap_err();
+        assert!(error.contains("no telemetry block in MakerNote"), "{error}");
+    }
+
+    /// Real-camera check, skipped by default because it needs a SIGMA fp DNG:
+    /// `FP_DNG_SAMPLE=/path/A001_001_..._000001.DNG cargo test real_fp -- --ignored`
+    /// Writes a block into the zero tail of the real MakerNote, the way the
+    /// camera will, and reads it back through the plugin's reader.
+    #[test]
+    #[ignore]
+    fn real_fp_dng_maker_note_tail_round_trip() {
+        let source = std::env::var("FP_DNG_SAMPLE").expect("set FP_DNG_SAMPLE to an fp CinemaDNG frame");
+        let original = fs::read(&source).unwrap();
+        let mut tiff = TiffReader::open(Path::new(&source)).unwrap();
+        let root_offset = tiff.root_ifd_offset().unwrap();
+        let root = tiff.read_ifd(root_offset).unwrap();
+        let exif_offset = tiff.sub_ifd_offset(find_unique(&root, EXIF_IFD_TAG, "Exif").unwrap().unwrap(), "Exif").unwrap();
+        let exif = tiff.read_ifd(exif_offset).unwrap();
+        let note = find_unique(&exif, MAKER_NOTE_TAG, "MakerNote").unwrap().unwrap();
+        let note_start = tiff.order.u32(&note.value) as usize;
+        let note_end = note_start + note.count as usize;
+        let tail_start = note_end - original[note_start..note_end].iter().rev().take_while(|byte| **byte == 0).count();
+        let tail = note_end - tail_start;
+        println!("MakerNote {note_start:#x}..{note_end:#x}, zero tail {tail_start:#x}.. ({tail} bytes)");
+
+        let dir = TestDir::new();
+        for number in [1_u32, 2] {
+            let encoded = block(&message(number, number == 1).encode_to_vec(), BLOCK_KIND_PROTOBUF);
+            // Leave a gap after the vendor data, as the camera writer should.
+            let at = tail_start + 64;
+            assert!(at + encoded.len() <= note_end, "block does not fit in the zero tail");
+            let mut frame = original.clone();
+            frame[at..at + encoded.len()].copy_from_slice(&encoded);
+            fs::write(dir.frame(number), frame).unwrap();
+        }
+        let sequence = read_embedded_protobuf_sequence(&dir.frame(1)).unwrap();
+        assert_eq!(sequence.frame_count, 2);
+        // The untouched camera frame has no block: only the injected copies do.
+        assert!(read_frame_payload(Path::new(&source)).unwrap_err().contains("no telemetry block"));
     }
 }
