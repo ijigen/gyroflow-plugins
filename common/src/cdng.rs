@@ -1256,4 +1256,43 @@ mod tests {
         drop(gyro);
         check_lens_reaches_core(&manager, frames as usize);
     }
+
+    /// A recorded clip, skipped by default:
+    /// `FP_CLIP_DIR=/path/A001_031 cargo test real_fp_clip -- --ignored --nocapture`
+    /// Reads every frame's FSG2 record (the files may be just their headers),
+    /// converts the take and loads it into gyroflow-core.
+    #[test]
+    #[ignore]
+    fn real_fp_clip_dir() {
+        let dir = std::env::var("FP_CLIP_DIR").expect("set FP_CLIP_DIR to a clip folder");
+        let mut names: Vec<_> = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("dng")))
+            .collect();
+        names.sort();
+        let first = names.first().expect("no DNG in FP_CLIP_DIR");
+        let sequence = read_embedded_protobuf_sequence(first).unwrap();
+        println!("frames {} size {}x{} fps {:.3} jsonl {} bytes", sequence.frame_count, sequence.width, sequence.height, sequence.fps, sequence.jsonl.len());
+        let metadata = gyroflow_core::telemetry_parser::util::VideoMetadata {
+            width: sequence.width,
+            height: sequence.height,
+            fps: sequence.fps,
+            duration_s: sequence.frame_count as f64 / sequence.fps,
+            rotation: sequence.rotation,
+        };
+        let url = gyroflow_core::filesystem::path_to_url(&std::path::Path::new(&dir).join("t.jsonl").to_string_lossy());
+        let mut stream = std::io::Cursor::new(sequence.jsonl.as_slice());
+        let manager = gyroflow_core::StabilizationManager::default();
+        manager.load_video_file(&mut stream, sequence.jsonl.len(), &url, Some(metadata), true).unwrap();
+        let gyro = manager.gyro.read();
+        let md = gyro.file_metadata.read();
+        let imu = &md.raw_imu;
+        let span_s = imu.last().map_or(0.0, |l| l.timestamp_ms - imu[0].timestamp_ms) / 1000.0;
+        let max_dps = imu.iter().filter_map(|s| s.gyro).map(|g| g.iter().fold(0.0_f64, |m, v| m.max(v.abs()))).fold(0.0, f64::max);
+        println!("raw_imu {} over {:.3} s = {:.1} Hz, max |gyro| {:.2} deg/s, frame offsets {}, quaternions {}, readout {:?} ms",
+            imu.len(), span_s, (imu.len().saturating_sub(1)) as f64 / span_s.max(1e-9), max_dps,
+            md.per_frame_time_offsets.len(), gyro.quaternions.len(), md.frame_readout_time);
+        assert_eq!(md.per_frame_time_offsets.len(), sequence.frame_count);
+        assert!(gyro.quaternions.values().all(|q| q.coords.iter().all(|c| c.is_finite())));
+    }
 }
