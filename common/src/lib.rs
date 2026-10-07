@@ -584,7 +584,8 @@ impl GyroflowPluginBaseInstance {
         let manual_focal = params.get_f64(Params::ManualFocalLength).unwrap_or(0.0);
         let manual_corner = (!params.get_bool(Params::ManualDistortionAuto).unwrap_or(true))
             .then(|| params.get_f64(Params::ManualDistortion).unwrap_or(0.0) / 100.0);
-        let key = format!("{path}{disable_stretch}{manual_focal}{manual_corner:?}{instance_id}");
+        let lens_query = params.get_string(Params::LensSearch).unwrap_or_default();
+        let key = format!("{path}{disable_stretch}{manual_focal}{manual_corner:?}{lens_query}{instance_id}");
         let cloned = manager_cache.lock().get(&key).map(Arc::clone);
         let stab = if let Some(stab) = cloned {
             // Cache it in this instance as well
@@ -695,8 +696,29 @@ impl GyroflowPluginBaseInstance {
                             stab.params.write().output_size = preset_out_size;
                         }
 
+                        // An fp lens profile searched by name: read here, at load, so it
+                        // works whether or not the host reported the edit; it takes the
+                        // place of an embedded profile.
+                        let mut searched = false;
+                        if !lens_query.trim().is_empty() {
+                            let width = stab.params.read().size.0;
+                            match lensdb::find_fp_profile(&lens_query, width) {
+                                Some((label, json)) => {
+                                    if stab.load_lens_profile(&json).is_ok() {
+                                        searched = true;
+                                        let _ = params.set_string(Params::LoadedLens, &label);
+                                        let _ = params.set_string(Params::LensSearchResult, &format!("Using: {label}"));
+                                    }
+                                }
+                                None => {
+                                    let _ = params.set_string(Params::LensSearchResult, &format!("No SIGMA fp profile for \"{}\": use Manual lens focal", lens_query.trim()));
+                                }
+                            }
+                        } else if params.get_string(Params::LensSearchResult).is_ok_and(|s| !s.is_empty()) {
+                            let _ = params.set_string(Params::LensSearchResult, "");
+                        }
                         if let Ok(d) = params.get_string(Params::EmbeddedLensProfile) {
-                            if !d.is_empty() {
+                            if !d.is_empty() && !searched {
                                 if let Err(e) = stab.load_lens_profile(&d) {
                                     rfd::MessageDialog::new()
                                         .set_description(&format!("Failed to load lens profile: {e:?}"))
@@ -1056,27 +1078,9 @@ impl GyroflowPluginBaseInstance {
                 }
             }
         }
-        if param == Params::LensSearch && user_edited {
-            let query = params.get_string(Params::LensSearch).unwrap_or_default();
-            log::info!("lens search: {query:?}");
-            if query.trim().is_empty() {
-                params.set_string(Params::EmbeddedLensProfile, "")?;
-                params.set_string(Params::LoadedLens, "")?;
-                params.set_string(Params::LensSearchResult, "")?;
-            } else {
-                let width = params.get_f64(Params::OutputWidth).unwrap_or(3840.0) as usize;
-                match lensdb::find_fp_profile(&query, width) {
-                    Some((label, json)) => {
-                        params.set_string(Params::EmbeddedLensProfile, &json)?;
-                        params.set_string(Params::LoadedLens, &label)?;
-                        params.set_string(Params::LensSearchResult, &format!("Using: {label}"))?;
-                    }
-                    None => {
-                        params.set_string(Params::LensSearchResult, &format!("No SIGMA fp profile for \"{}\": use Manual lens focal", query.trim()))?;
-                    }
-                }
-            }
-            self.reload_values_from_project = true;
+        if param == Params::LensSearch {
+            // Applied where the clip loads (stab_manager): some hosts (Resolve's
+            // Fusion page) never report this edit, so nothing may hang on it here.
             self.clear_stab(&manager_cache);
         }
         if param == Params::OpenGyroflow {

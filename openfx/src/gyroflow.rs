@@ -10,7 +10,7 @@ use gyroflow_plugin_base::lru::LruCache;
 plugin_module!(
     "io.github.ijigen.fpsup.gyroflow",
     ApiVersion(1),
-    PluginVersion(1, 5),
+    PluginVersion(1, 6),
     GyroflowPlugin::default
 );
 
