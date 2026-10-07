@@ -1260,6 +1260,65 @@ mod tests {
         check_lens_reaches_core(&manager, frames as usize);
     }
 
+    /// Gyroflow's own autosync on a recorded clip, skipped by default:
+    /// `FP_CLIP_DIR=.../A001_016 FP_GRAY=gray.raw cargo test real_fp_autosync -- --ignored --nocapture`
+    /// FP_GRAY holds the clip's frames as 8-bit gray, header u32 n, w, h. FP_SHIFT
+    /// feeds each image one frame late (to tell the sign of the result).
+    /// The offsets it prints are what the Vd timing is still off by.
+    #[test]
+    #[ignore]
+    fn real_fp_autosync() {
+        use std::sync::{Arc, Mutex, atomic::AtomicBool};
+        use gyroflow_core::synchronization::{AutosyncProcess, AutosyncResult, SyncParams};
+        let dir = std::env::var("FP_CLIP_DIR").expect("FP_CLIP_DIR");
+        let raw = fs::read(std::env::var("FP_GRAY").expect("FP_GRAY")).unwrap();
+        let shift = std::env::var("FP_SHIFT").is_ok() as usize;
+        let mut names: Vec<_> = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("dng"))).collect();
+        names.sort();
+        let sequence = read_embedded_protobuf_sequence(&names[0]).unwrap();
+        let metadata = gyroflow_core::telemetry_parser::util::VideoMetadata {
+            width: sequence.width, height: sequence.height, fps: sequence.fps,
+            duration_s: sequence.frame_count as f64 / sequence.fps, rotation: sequence.rotation,
+        };
+        let url = gyroflow_core::filesystem::path_to_url(&std::path::Path::new(&dir).join("t.jsonl").to_string_lossy());
+        let mut stream = std::io::Cursor::new(sequence.jsonl.as_slice());
+        let manager = gyroflow_core::StabilizationManager::default();
+        manager.load_video_file(&mut stream, sequence.jsonl.len(), &url, Some(metadata), true).unwrap();
+        manager.recompute_blocking();
+
+        let n = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
+        let (w, h) = (u32::from_le_bytes(raw[4..8].try_into().unwrap()), u32::from_le_bytes(raw[8..12].try_into().unwrap()));
+        let frame = (w * h) as usize;
+        let params = SyncParams {
+            initial_offset: 0.0, initial_offset_inv: false, search_size: 200.0, calc_initial_fast: false,
+            max_sync_points: 8, every_nth_frame: 1, time_per_syncpoint: 1500.0,
+            of_method: 0, offset_method: 2, pose_method: 1,
+            custom_sync_pattern: serde_json::Value::Null, auto_sync_points: false,
+        };
+        let points: Vec<f64> = (1..=8).map(|i| i as f64 / 9.0).collect();
+        let mut process = AutosyncProcess::from_manager(&manager, &points, params, "synchronize".into(), Arc::new(AtomicBool::new(false))).unwrap();
+        let result = Arc::new(Mutex::new(None));
+        let sink = result.clone();
+        process.on_finished(move |r| { *sink.lock().unwrap() = Some(r); });
+        for k in 0..n.min(sequence.frame_count) {
+            let image = k.saturating_sub(shift);
+            let pixels = &raw[12 + image * frame..12 + (image + 1) * frame];
+            let ts = (k as f64 * 1e6 / sequence.fps).round() as i64;
+            process.feed_frame(ts, k, w, h, w as usize, pixels);
+        }
+        process.finished_feeding_frames();
+        match result.lock().unwrap().take() {
+            Some(AutosyncResult::Offsets(offsets)) => {
+                for (ts, offset, cost) in &offsets { println!("sync point {:.0} ms: offset {offset:+.3} ms, cost {cost:.4}", ts); }
+                let mut o: Vec<f64> = offsets.iter().map(|x| x.1).collect();
+                o.sort_by(f64::total_cmp);
+                if !o.is_empty() { println!("median offset {:+.3} ms over {} points (shift {shift})", o[o.len() / 2], o.len()); }
+            }
+            _ => println!("no offsets"),
+        }
+    }
+
     /// A recorded clip, skipped by default:
     /// `FP_CLIP_DIR=/path/A001_031 cargo test real_fp_clip -- --ignored --nocapture`
     /// Reads every frame's FSG2 record (the files may be just their headers),

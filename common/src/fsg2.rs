@@ -75,8 +75,11 @@ const STANDARD_GRAVITY: f64 = 9.80665;
 /// From a frame's Vd to the readout of its first sensor row, in microseconds.
 /// Vd is fixed in the readout, not in the exposure: between 1/250 and 1/50 s
 /// the frames' optical-flow centre moved by about minus half the exposure
-/// (A001_012 and A001_016, 2026-10-07). Measured to about +-3 ms.
-pub const VD_TO_READOUT_US: f64 = 1_800.0;
+/// (A001_012 and A001_016, 2026-10-07). Gyroflow's own autosync on both takes
+/// then found the frames 0.9 ms late at 1.8 ms (medians of 8 sync points:
+/// +1.25 and +0.93 ms; a one-frame shift of the images read +34.5): 0.9 ms,
+/// to about +-1 ms.
+pub const VD_TO_READOUT_US: f64 = 900.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Event {
