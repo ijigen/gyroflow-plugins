@@ -1277,56 +1277,56 @@ macro_rules! define_params {
                 let $gstr_s = &self.fields;
                 match param {
                     $( Params::$str_enum => { let $gstr_p = &self.$str_field; $gstr_block }, )*
-                    _ => panic!("Wrong parameter type"),
+                    _ => return Err(format!("parameter {param:?} is not registered with this host").into()),
                 }
             }
             fn set_string(&mut self, param: Params, value: &str) -> $crate::PluginResult<()> {
                 let mut $sstr_s = &mut self.fields;
                 match param {
                     $( Params::$str_enum => { let $sstr_p = &mut self.$str_field; let $sstr_v = value; $sstr_block }, )*
-                    _ => panic!("Wrong parameter type"),
+                    _ => return Err(format!("parameter {param:?} is not registered with this host").into()),
                 }
             }
             fn get_bool(&self, param: Params) -> $crate::PluginResult<bool> {
                 let $gbool_s = &self.fields;
                 match param {
                     $( Params::$bool_enum => { let $gbool_p = &self.$bool_field; $gbool_block }, )*
-                    _ => panic!("Wrong parameter type"),
+                    _ => return Err(format!("parameter {param:?} is not registered with this host").into()),
                 }
             }
             fn set_bool(&mut self, param: Params, value: bool) -> $crate::PluginResult<()> {
                 let mut $sbool_s = &mut self.fields;
                 match param {
                     $( Params::$bool_enum => { let $sbool_p = &mut self.$bool_field; let $sbool_v = value; $sbool_block }, )*
-                    _ => panic!("Wrong parameter type"),
+                    _ => return Err(format!("parameter {param:?} is not registered with this host").into()),
                 }
             }
             fn get_f64(&self, param: Params) -> $crate::PluginResult<f64> {
                 let $gf64_s = &self.fields;
                 match param {
                     $( Params::$f64_enum => { let $gf64_p = &self.$f64_field; $gf64_block }, )*
-                    _ => panic!("Wrong parameter type"),
+                    _ => return Err(format!("parameter {param:?} is not registered with this host").into()),
                 }
             }
             fn set_f64(&mut self, param: Params, value: f64) -> $crate::PluginResult<()> {
                 let mut $sf64_s = &mut self.fields;
                 match param {
                     $( Params::$f64_enum => { let $sf64_p = &mut self.$f64_field; let $sf64_v = value; $sf64_block }, )*
-                    _ => panic!("Wrong parameter type"),
+                    _ => return Err(format!("parameter {param:?} is not registered with this host").into()),
                 }
             }
             fn get_i32(&self, param: Params) -> $crate::PluginResult<i32> {
                 let $gi32_s = &self.fields;
                 match param {
                     $( Params::$i32_enum => { let $gi32_p = &self.$i32_field; $gi32_block }, )*
-                    _ => panic!("Wrong parameter type"),
+                    _ => return Err(format!("parameter {param:?} is not registered with this host").into()),
                 }
             }
             fn set_i32(&mut self, param: Params, value: i32) -> $crate::PluginResult<()> {
                 let mut $si32_s = &mut self.fields;
                 match param {
                     $( Params::$i32_enum => { let $si32_p = &mut self.$i32_field; let $si32_v = value; $si32_block }, )*
-                    _ => panic!("Wrong parameter type"),
+                    _ => return Err(format!("parameter {param:?} is not registered with this host").into()),
                 }
             }
             fn set_label(&mut self, param: Params, label: &str) -> $crate::PluginResult<()> {
@@ -1337,7 +1337,7 @@ macro_rules! define_params {
                     $( Params::$bool_enum => { let $slabel_p = &mut self.$bool_field; $slabel_block }, )*
                     $( Params::$f64_enum  => { let $slabel_p = &mut self.$f64_field;  $slabel_block }, )*
                     $( Params::$i32_enum  => { let $slabel_p = &mut self.$i32_field;  $slabel_block }, )*
-                    _ => panic!("Wrong parameter type"),
+                    _ => return Err(format!("parameter {param:?} is not registered with this host").into()),
                 }
             }
             fn set_hint(&mut self, param: Params, hint: &str) -> $crate::PluginResult<()> {
@@ -1348,7 +1348,7 @@ macro_rules! define_params {
                     $( Params::$bool_enum => { let $shint_p = &mut self.$bool_field; $shint_block }, )*
                     $( Params::$f64_enum  => { let $shint_p = &mut self.$f64_field;  $shint_block }, )*
                     $( Params::$i32_enum  => { let $shint_p = &mut self.$i32_field;  $shint_block }, )*
-                    _ => panic!("Wrong parameter type"),
+                    _ => return Err(format!("parameter {param:?} is not registered with this host").into()),
                 }
             }
             fn set_enabled(&mut self, param: Params, enabled: bool) -> $crate::PluginResult<()> {
@@ -1359,49 +1359,49 @@ macro_rules! define_params {
                     $( Params::$bool_enum => { let $sen_p = &mut self.$bool_field; $sen_block }, )*
                     $( Params::$f64_enum  => { let $sen_p = &mut self.$f64_field;  $sen_block }, )*
                     $( Params::$i32_enum  => { let $sen_p = &mut self.$i32_field;  $sen_block }, )*
-                    _ => panic!("Wrong parameter type"),
+                    _ => return Err(format!("parameter {param:?} is not registered with this host").into()),
                 }
             }
             fn get_f64_at_time(&self, param: Params, time: TimeType) -> $crate::PluginResult<f64> {
                 let $gtf64_s = &self.fields;
                 match param {
                     $( Params::$f64_enum => { let $gtf64_p = &self.$f64_field; let $gtf64_t = time; $gtf64_block }, )*
-                    _ => panic!("Wrong parameter type"),
+                    _ => return Err(format!("parameter {param:?} is not registered with this host").into()),
                 }
             }
             fn get_bool_at_time(&self, param: Params, time: TimeType) -> $crate::PluginResult<bool> {
                 let $gtbool_s = &self.fields;
                 match param {
                     $( Params::$bool_enum => { let $gtbool_p = &self.$bool_field; let $gtbool_t = time; $gtbool_block }, )*
-                    _ => panic!("Wrong parameter type"),
+                    _ => return Err(format!("parameter {param:?} is not registered with this host").into()),
                 }
             }
             fn clear_keyframes(&mut self, param: Params) -> $crate::PluginResult<()> {
                 let mut $clr_s = &mut self.fields;
                 match param {
                     $( Params::$f64_enum => { let $clr_p = &mut self.$f64_field; $clr_block }, )*
-                    _ => panic!("Wrong parameter type"),
+                    _ => return Err(format!("parameter {param:?} is not registered with this host").into()),
                 }
             }
             fn is_keyframed(&self, param: Params) -> bool {
                 let $iskeyframe_s = &self.fields;
                 match param {
                     $( Params::$f64_enum => { let $iskeyframe_p = &self.$f64_field; $iskeyframe_block }, )*
-                    _ => panic!("Wrong parameter type"),
+                    _ => false,
                 }
             }
             fn get_keyframes(&self, param: Params) -> Vec<(TimeType, f64)> {
                 let $gkeyframes_s = &self.fields;
                 match param {
                     $( Params::$f64_enum => { let $gkeyframes_p = &self.$f64_field; $gkeyframes_block }, )*
-                    _ => panic!("Wrong parameter type"),
+                    _ => Vec::new(),
                 }
             }
             fn set_f64_at_time(&mut self, param: Params, time: TimeType, value: f64) -> $crate::PluginResult<()> {
                 let mut $stf64_s = &mut self.fields;
                 match param {
                     $( Params::$f64_enum => { let $stf64_p = &mut self.$f64_field; let $stf64_t = time; let $stf64_v = value; $stf64_block }, )*
-                    _ => panic!("Wrong parameter type"),
+                    _ => return Err(format!("parameter {param:?} is not registered with this host").into()),
                 }
             }
         }
