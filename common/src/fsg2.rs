@@ -50,6 +50,9 @@ pub const FLAG_LENS_TABLE: u16 = 1 << 6;
 
 pub const EVENT_LEVEL: u8 = 1;
 pub const EVENT_FOCUS: u8 = 2;
+/// The sensor's frame sync, Vd (IRQ 0x79): placed at the gyro stream position
+/// where it fired, with the TickTimer (u32 microseconds) as its value.
+pub const EVENT_VD: u8 = 3;
 
 /// calib_focal u32 + five u32 focus support points + 5 x 3 x 4 f64 coefficients.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -61,13 +64,11 @@ const SENSOR_PIXEL_HEIGHT: u32 = 4000;
 const PIXEL_PITCH_NM: u32 = 5983;
 const STANDARD_GRAVITY: f64 = 9.80665;
 
-/// Constant from the frame hook to the readout of the first sensor row, in
-/// microseconds: the first row is read out this long before the hook runs.
-/// Measured 2026-10-07 by matching the frames' optical-flow rotation against
-/// the gyro (A001_044 FHD 59.94p, readout 10.556 ms: -13.28 ms; A001_042 OG3K
-/// 29.97p, readout 12.435 ms: -13.42 ms; both exposure 4 ms, yaw correlation
-/// 0.97 and 0.9996).
-pub const HOOK_TO_READOUT_US: f64 = -13_350.0;
+/// From a frame's Vd to the readout of its first sensor row, in microseconds.
+/// Vd is fixed in the readout, not in the exposure: between 1/250 and 1/50 s
+/// the frames' optical-flow centre moved by about minus half the exposure
+/// (A001_012 and A001_016, 2026-10-07). Measured to about +-3 ms.
+pub const VD_TO_READOUT_US: f64 = 1_800.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Event {
@@ -171,6 +172,7 @@ pub fn parse(payload: &[u8]) -> Result<Record, String> {
         let expected = match kind {
             EVENT_LEVEL => Some(6),
             EVENT_FOCUS => Some(4),
+            EVENT_VD => Some(4),
             _ => None, // unknown kinds are skipped by length
         };
         if expected.is_some_and(|n| n != len) {
@@ -227,6 +229,66 @@ pub struct DngInfo {
 /// Samples are deduplicated by global index, so guard samples that two
 /// neighbouring blocks share are emitted once and a dropped block leaves a gap
 /// rather than a shift. The accelerometer is sample-and-hold from level events.
+/// Each frame's Vd, as a gyro stream position (samples, fractional).
+///
+/// Vd fires once per sensor frame on the sensor's clock (+-5 us measured), so
+/// all of a take's Vd positions lie on one line: index n at a + b n, b being
+/// the samples per frame, fitted (it absorbs the two clocks' drift). Which Vd
+/// is a frame's: the frame hook runs a steady time after its Vd, but now and
+/// then tens of milliseconds late, past the next Vd. So each frame's index is
+/// its frame_seq plus an offset, the offset taken as the median over nine
+/// frames of what each hook suggests: a late hook is outvoted, a sensor frame
+/// the recording skipped (a lasting step) is not.
+pub fn vd_frame_positions(frames: &[(Record, DngInfo)], fps: f64) -> Result<Vec<f64>, String> {
+    let period_s = frames.first().ok_or("no frames")?.0.sample_period_ps as f64 * 1e-12;
+    if !(period_s > 0.0 && fps > 0.0) {
+        return Err("no sample period or frame rate".to_owned());
+    }
+    let nominal = 1.0 / (fps * period_s);
+    let mut vds: Vec<f64> = frames.iter()
+        .flat_map(|(r, _)| r.events.iter().filter(|e| e.kind == EVENT_VD).map(move |e| r.base_idx as f64 + e.pos as f64))
+        .collect();
+    vds.sort_by(f64::total_cmp);
+    vds.dedup();
+    if vds.len() < 2 {
+        return Err("this take has no Vd frame sync (it needs Gyro2 with the Vd hook)".to_owned());
+    }
+    let index: Vec<f64> = vds.iter().map(|v| ((v - vds[0]) / nominal).round()).collect();
+    let n = vds.len() as f64;
+    let (mi, mv) = (index.iter().sum::<f64>() / n, vds.iter().sum::<f64>() / n);
+    let sii: f64 = index.iter().map(|i| (i - mi).powi(2)).sum();
+    let siv: f64 = index.iter().zip(&vds).map(|(i, v)| (i - mi) * (v - mv)).sum();
+    if !(sii > 0.0) {
+        return Err("Vd frame sync events do not span a frame".to_owned());
+    }
+    let slope = siv / sii;
+    if (slope / nominal - 1.0).abs() > 0.01 {
+        return Err(format!("Vd every {slope:.2} samples does not match {fps:.3} fps ({nominal:.2})"));
+    }
+    let line = |i: f64| mv + slope * (i - mi);      // Vd number i, counted from the take's first
+
+    let hooks: Vec<f64> = frames.iter().map(|(r, _)| r.base_idx as f64 + r.frame_mark as f64).collect();
+    let mut lags: Vec<f64> = hooks.iter().filter_map(|h| {
+        let i = ((h - line(0.0)) / slope).floor();
+        (i >= 0.0).then(|| h - line(i))
+    }).collect();
+    if lags.is_empty() {
+        return Err("no frame hook after a Vd".to_owned());
+    }
+    lags.sort_by(f64::total_cmp);
+    let lag = lags[lags.len() / 2];
+    let offsets: Vec<i64> = frames.iter().zip(&hooks)
+        .map(|((r, _), h)| ((h - lag - line(0.0)) / slope).round() as i64 - r.frame_seq as i64)
+        .collect();
+    Ok(frames.iter().enumerate().map(|(k, (r, _))| {
+        let lo = k.saturating_sub(4);
+        let hi = (k + 5).min(offsets.len());
+        let mut window = offsets[lo..hi].to_vec();
+        window.sort_unstable();
+        line((r.frame_seq as i64 + window[window.len() / 2]) as f64)
+    }).collect())
+}
+
 pub fn to_messages(frames: &[(Record, DngInfo)]) -> Result<Vec<gyroflow_proto::Main>, String> {
     let (first, first_dng) = frames.first().ok_or("no kind 2 frames")?;
     let (width, height) = first_dng.frame_size
@@ -307,12 +369,13 @@ pub fn to_messages(frames: &[(Record, DngInfo)]) -> Result<Vec<gyroflow_proto::M
     // reach fall back to their own WarpRectilinear opcode.
     let lens_table = frames.iter().find_map(|(record, _)| record.lens_table.as_ref());
 
+    let vd_positions = vd_frame_positions(frames, fps)?;
     let mut next_global: u64 = 0;
     let mut messages = Vec::with_capacity(frames.len());
     for (index, (record, dng)) in frames.iter().enumerate() {
         let base = record.base_idx as u64;
         let time_of = |position: u64| (base + position) as f64 * period_us;
-        let start = time_of(record.frame_mark as u64) + HOOK_TO_READOUT_US;
+        let start = vd_positions[index] * period_us + VD_TO_READOUT_US;
 
         // Level events in this block, by position, to hold the accelerometer.
         let mut levels: Vec<(u64, [f32; 3])> = record.events.iter()
@@ -484,6 +547,19 @@ mod tests {
         Event { pos, kind: EVENT_LEVEL, value: raw.iter().flat_map(|v| v.to_le_bytes()).collect() }
     }
 
+    /// A take's frames with a Vd stream: Vd every nominal frame from the first
+    /// frame's base (all carried in the first block; only positions count).
+    pub fn with_vd(mut frames: Vec<(Record, DngInfo)>) -> Vec<(Record, DngInfo)> {
+        let per_frame = 1.0 / (30000.0 / 1001.0 * PERIOD_PS as f64 * 1e-12);
+        let count = frames.len() + 2;
+        let first = &mut frames[0].0;
+        for n in 0..count {
+            let pos = (n as f64 * per_frame).round() as u16;
+            first.events.push(Event { pos, kind: EVENT_VD, value: (n as u32 * 33_367).to_le_bytes().to_vec() });
+        }
+        frames
+    }
+
     fn dng() -> DngInfo {
         DngInfo {
             make: Some("SIGMA".into()),
@@ -561,12 +637,47 @@ mod tests {
     }
 
     #[test]
+    fn each_frame_takes_its_own_vd_through_late_hooks_and_skipped_frames() {
+        let fps = 30000.0 / 1001.0;
+        let per_frame = 1.0 / (fps * PERIOD_PS as f64 * 1e-12);       // 83.40
+        let vd = |n: f64| 1000.0 + n * per_frame * (1.0 + 2e-3);     // the clocks drift (exaggerated: 0.2 %)
+        // 40 frames; sensor frame 25 was skipped by the recording (frame_seq goes on).
+        let sensor: Vec<f64> = (0..40).map(|k| if k < 25 { k as f64 } else { k as f64 + 1.0 }).collect();
+        let lag = [35.0, 34.0, 36.0, 35.0, 35.0];
+        let hooks: Vec<u32> = sensor.iter().enumerate().map(|(k, n)| {
+            (vd(*n) + lag[k % 5] + if k == 12 { 60.0 } else { 0.0 }).round() as u32   // frame 12: late, past the next Vd
+        }).collect();
+        // Every sensor frame's Vd fired (the skipped one's too), but some never
+        // reached a block; each lands in the block whose span holds it, as on the camera.
+        let vds: Vec<u32> = (0..41).filter(|n| n % 7 != 3).map(|n| vd(n as f64).round() as u32).collect();
+        let mut frames = Vec::new();
+        let mut start = 900u32;
+        for (k, hook) in hooks.iter().enumerate() {
+            let mut r = record(start, k as u32, vec![]);
+            r.frame_mark = (hook - start) as u16;
+            for v in vds.iter().filter(|v| **v >= start && **v < *hook) {
+                r.events.push(Event { pos: (v - start) as u16, kind: EVENT_VD, value: vec![0; 4] });
+            }
+            start = *hook;
+            frames.push((r, dng()));
+        }
+        let got = vd_frame_positions(&frames, fps).unwrap();
+        for (k, n) in sensor.iter().enumerate() {
+            assert!((got[k] - vd(*n)).abs() < 0.6, "frame {k}: {} vs {}", got[k], vd(*n));
+        }
+        // Without Vd the take is refused.
+        for (r, _) in &mut frames { r.events.clear(); }
+        assert!(vd_frame_positions(&frames, fps).unwrap_err().contains("no Vd"));
+    }
+
+    #[test]
     fn timing_and_units_come_from_positions_and_scales() {
-        let frames = vec![(record(100, 0, vec![[131, 0, -131]; 4]), dng())];
+        let frames = with_vd(vec![(record(100, 0, vec![[131, 0, -131]; 4]), dng())]);
         let messages = to_messages(&frames).unwrap();
         let frame = messages[0].frame.as_ref().unwrap();
         let period_us = PERIOD_PS as f64 / 1e6;
-        assert!((frame.start_timestamp_us - (102.0 * period_us + HOOK_TO_READOUT_US)).abs() < 1e-6);
+        // the frame's Vd is at 100 (the first of the stream), its hook 2 later
+        assert!((frame.start_timestamp_us - (100.0 * period_us + VD_TO_READOUT_US)).abs() < 0.5 * period_us);
         assert!((frame.end_timestamp_us - frame.start_timestamp_us - 21_325.0).abs() < 1e-6);
         assert!((frame.imu[3].sample_timestamp_us.unwrap() - 103.0 * period_us).abs() < 1e-6);
         let dps = 131.0 * GSCALE as f64 * 180.0 / std::f64::consts::PI;
@@ -591,7 +702,7 @@ mod tests {
             (lost, dng()),
             (record(30, 3, vec![[3, 0, 0]; 5]), dng()),
         ];
-        let messages = to_messages(&frames).unwrap();
+        let messages = to_messages(&with_vd(frames)).unwrap();
         let counts: Vec<usize> = messages.iter().map(|m| m.frame.as_ref().unwrap().imu.len()).collect();
         assert_eq!(counts, vec![10, 5, 0, 5]);
         let period_us = PERIOD_PS as f64 / 1e6;
@@ -608,7 +719,7 @@ mod tests {
         first.events = vec![level(2, [100, 200, 1024])];
         let mut second = record(4, 1, vec![[0, 0, 0]; 2]);
         second.events = vec![level(1, [-50, 0, 1000])];
-        let messages = to_messages(&[(first, dng()), (second, dng())]).unwrap();
+        let messages = to_messages(&with_vd(vec![(first, dng()), (second, dng())])).unwrap();
         let g = ASCALE as f64 * STANDARD_GRAVITY;
         let acc = |m: usize, i: usize| {
             let s = &messages[m].frame.as_ref().unwrap().imu[i];
@@ -655,7 +766,7 @@ mod tests {
         let mut second = record(1, 1, vec![[0, 0, 0]]);
         second.crop[2] = 6000;
         let at = |metres: Option<f64>| DngInfo { frame_size: Some((1936, 1090)), focal_length_mm: Some(40.0), subject_distance_m: metres, ..dng() };
-        let messages = to_messages(&[(first, at(None)), (second, at(Some(0.364)))]).unwrap();
+        let messages = to_messages(&with_vd(vec![(first, at(None)), (second, at(Some(0.364)))])).unwrap();
 
         // Golden values from fpSup's Python mirror of the camera's fit.
         let infinity = lens_of(&messages[0]);
@@ -674,14 +785,14 @@ mod tests {
     #[test]
     fn without_a_table_each_frame_uses_its_own_warp_opcode() {
         let opcode = DngInfo { warp_rectilinear: Some([1.000334, -0.01484, 0.00518, -0.009761]), ..dng() };
-        let messages = to_messages(&[(record(0, 0, vec![]), opcode)]).unwrap();
+        let messages = to_messages(&with_vd(vec![(record(0, 0, vec![]), opcode)])).unwrap();
         let lens = lens_of(&messages[0]);
         assert_eq!(fisheye(lens).len(), 4);
         // The breathing term rides on the 28 mm focal: 1920 x 28 / 35.9 x kr0.
         let focal = 1920.0 * 28.0 / (35.9 * 5872.0 / 6000.0) * 1.000334;
         assert!((lens.camera_intrinsic_matrix[0] as f64 - focal).abs() < 1e-2);
 
-        let plain = to_messages(&[(record(0, 0, vec![]), dng())]).unwrap();
+        let plain = to_messages(&with_vd(vec![(record(0, 0, vec![]), dng())])).unwrap();
         let lens = lens_of(&plain[0]);
         assert!(lens.distortion.is_none() && lens.camera_intrinsic_matrix.is_empty());
         assert_eq!(lens.focal_length_mm, Some(28.0));

@@ -1087,7 +1087,10 @@ mod tests {
             base_idx,
             // A slow pan: about 5 deg/s on the first axis, with some wobble.
             samples: (0..n).map(|i| [600 + (i as i16 % 7) * 3, -20, 15]).collect(),
-            events: vec![fsg2::Event { pos: 1, kind: fsg2::EVENT_LEVEL, value: [12_i16, -8, 1020].iter().flat_map(|v| v.to_le_bytes()).collect() }],
+            events: vec![
+                fsg2::Event { pos: 0, kind: fsg2::EVENT_VD, value: (frame_seq * 33_367).to_le_bytes().to_vec() },
+                fsg2::Event { pos: 1, kind: fsg2::EVENT_LEVEL, value: [12_i16, -8, 1020].iter().flat_map(|v| v.to_le_bytes()).collect() },
+            ],
             lens_table: None,
         }
     }
