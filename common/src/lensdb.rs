@@ -4,6 +4,20 @@
 use gyroflow_core::lens_profile_database::LensProfileDatabase;
 use std::sync::OnceLock;
 
+pub use crate::lensdb_fp_list::FP_PROFILES;
+
+/// The menu: "(none)" then every SIGMA fp profile.
+pub fn menu() -> Vec<&'static str> {
+    std::iter::once("(none)").chain(FP_PROFILES.iter().map(|(label, _)| *label)).collect()
+}
+
+/// Menu entry `index` (0 = none): its label and the profile as JSON.
+pub fn menu_profile(index: usize) -> Option<(&'static str, String)> {
+    let (label, file) = FP_PROFILES.get(index.checked_sub(1)?)?;
+    let json = database().find(file)?.get_json().ok()?;
+    Some((label, json))
+}
+
 fn database() -> &'static LensProfileDatabase {
     static DB: OnceLock<LensProfileDatabase> = OnceLock::new();
     DB.get_or_init(|| {
@@ -62,6 +76,19 @@ pub fn find_fp_profile(query: &str, frame_width: usize) -> Option<(String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_menu_entry_is_an_fp_profile_in_the_database() {
+        assert!(FP_PROFILES.len() > 100);
+        assert_eq!(menu()[0], "(none)");
+        assert!(menu_profile(0).is_none());
+        for (i, (label, file)) in FP_PROFILES.iter().enumerate() {
+            let profile = database().find(file).unwrap_or_else(|| panic!("{file} is not in the database"));
+            assert!(matches!(squash(&profile.camera_model).as_str(), "fp" | "sigmafp"), "{file}");
+            assert!(profile.fisheye_params.distortion_coeffs.len() >= 4, "{file}");
+            assert_eq!(menu_profile(i + 1).map(|(l, _)| l), Some(*label));
+        }
+    }
 
     #[test]
     fn finds_a_manual_lens_for_the_fp_by_its_words() {
