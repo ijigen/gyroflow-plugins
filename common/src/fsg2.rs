@@ -304,7 +304,8 @@ pub fn vd_frame_positions(frames: &[(Record, DngInfo)], fps: f64) -> Result<Vec<
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Options {
     /// A lens without electronic contacts: the frames carry no focal length,
-    /// so this one (mm) sizes the camera matrix, with no distortion.
+    /// so this one (mm) sizes the camera matrix, with the generic distortion
+    /// of `lensfit::generic_rectilinear`.
     pub manual_focal_mm: Option<f64>,
 }
 
@@ -477,8 +478,9 @@ fn lens_data(table: Option<&LensTable>, record: &Record, dng: &DngInfo, width: u
             let fx = lensfit::focal_px(width, mm, record.crop[2]) as f32;
             lens.focal_length_mm = Some(mm as f32);
             lens.camera_intrinsic_matrix = vec![fx, 0.0, width as f32 / 2.0, 0.0, fx, height as f32 / 2.0, 0.0, 0.0, 1.0];
+            let k = lensfit::generic_rectilinear(mm, width, height, fx as f64);
             lens.distortion = Some(gyroflow_proto::lens_data::Distortion::OpencvFisheye(gyroflow_proto::OpenCvFisheye {
-                coefficients: vec![0.0; 4],
+                coefficients: k.iter().map(|v| *v as f32).collect(),
             }));
         }
         return lens;
@@ -725,6 +727,7 @@ mod tests {
         let want = lensfit::focal_px(1920, 50.0, frames[0].0.crop[2]) as f32;
         assert!((fx - want).abs() < 1e-3, "{fx} vs {want}");
         assert_eq!(l[0].focal_length_mm, Some(50.0));
+        assert_eq!(fisheye(&l[0]), lensfit::generic_rectilinear(50.0, 1920, 1080, want as f64).iter().map(|v| *v as f32).collect::<Vec<_>>());
         // An electronic lens ignores the manual focal.
         let electronic = with_vd(vec![(record(0, 0, vec![[0, 0, 0]; 4]), DngInfo { focal_length_mm: Some(28.0), ..manual })]);
         let l = to_messages_with(&electronic, &Options { manual_focal_mm: Some(50.0) }).unwrap()[0].frame.as_ref().unwrap().lens.clone();

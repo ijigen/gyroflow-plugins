@@ -7,6 +7,7 @@ use std::sync::{ Arc, atomic::AtomicBool };
 
 mod cdng;
 mod fsg2;
+mod lensdb;
 mod lensfit;
 
 pub use gyroflow_core::{ StabilizationManager, keyframes::*, stabilization::*, filesystem, gpu::* };
@@ -54,6 +55,7 @@ pub enum Params {
     VideoSpeed,
     DisableStretch,
     ManualFocalLength,
+    LensSearch,
     IntegrationMethod,
     KeyframesGroup, KeyframesGroupEnd,
     UseGyroflowsKeyframes,
@@ -299,6 +301,7 @@ impl GyroflowPluginBase {
                 ParameterType::Slider   { id: "VideoSpeed",             label: "Video speed",          hint: "Use this slider to change video speed or keyframe it, instead of built-in speed changes in the editor", min: 0.0001, max: 1000.0, default: 100.0 },
                 ParameterType::Checkbox { id: "DisableStretch",         label: "Disable Gyroflow's stretch", hint: "If you used Input stretch in the lens profile in Gyroflow, and you de-stretched the video separately in your editor (by setting anamorphic squeeze factor), check this to disable Gyroflow's internal stretching.", default: false },
                 ParameterType::Slider   { id: "ManualFocalLength",      label: "Manual lens focal (mm)", hint: "SIGMA fp CinemaDNG with a lens without electronic contacts: its focal length in mm (0 = none). Ignored when the frames carry lens data.", min: 0.0, max: 1000.0, default: 0.0 },
+                ParameterType::TextBox  { id: "LensSearch",             label: "Lens profile search (fp)", hint: "SIGMA fp: type a lens name (e.g. helios 44) to take its profile from Gyroflow's lens database; empty clears it." },
                 ParameterType::Select   { id: "IntegrationMethod",      label: "Integration method",   hint: "IMU integration method", options: vec!["None", "Complementary", "VQF", "Simple gyro", "Simple gyro + accel", "Mahony", "Madgwick"], default: "VQF" },
                 //ParameterType::Slider   { id: "FusionStartFrame",       label: "Fusion Start Frame",   hint: "Fusion Start Frame (from Project Settings)", min: 0.0, max: 100000.0, default: 0.0 },
             ] },
@@ -997,6 +1000,26 @@ impl GyroflowPluginBaseInstance {
                     self.clear_stab(&manager_cache);
                 }
             }
+        }
+        if param == Params::LensSearch && user_edited {
+            let query = params.get_string(Params::LensSearch).unwrap_or_default();
+            if query.trim().is_empty() {
+                params.set_string(Params::EmbeddedLensProfile, "")?;
+                params.set_string(Params::LoadedLens, "")?;
+            } else {
+                let width = params.get_f64(Params::OutputWidth).unwrap_or(3840.0) as usize;
+                match lensdb::find_fp_profile(&query, width) {
+                    Some((label, json)) => {
+                        params.set_string(Params::EmbeddedLensProfile, &json)?;
+                        params.set_string(Params::LoadedLens, &label)?;
+                    }
+                    None => {
+                        params.set_string(Params::LoadedLens, &format!("No SIGMA fp profile matches \"{}\"", query.trim()))?;
+                    }
+                }
+            }
+            self.reload_values_from_project = true;
+            self.clear_stab(&manager_cache);
         }
         if param == Params::OpenGyroflow {
             GyroflowPluginBase::open_gyroflow(params.get_string(Params::ProjectPath).ok().as_deref());
