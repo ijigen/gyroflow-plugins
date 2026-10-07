@@ -10,7 +10,7 @@ use gyroflow_plugin_base::lru::LruCache;
 plugin_module!(
     "io.github.ijigen.fpsup.gyroflow",
     ApiVersion(1),
-    PluginVersion(1, 2),
+    PluginVersion(1, 3),
     GyroflowPlugin::default
 );
 
@@ -510,6 +510,7 @@ impl Execute for GyroflowPlugin {
                 let mut instance_id = instance_data.params.get_string(Params::InstanceId).unwrap_or_default();
                 instance_data.plugin.initialize_instance_id(&mut instance_id);
                 let _ = instance_data.params.set_string(Params::InstanceId, &instance_id);
+                GyroflowPluginBaseInstance::show_update_status(&mut instance_data.params);
 
                 let props: EffectInstance = effect.properties()?;
                 if matches!(props.get_resolve_page().as_deref(), Ok("Edit") | Ok("Color")) {

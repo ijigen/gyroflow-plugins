@@ -565,7 +565,6 @@ impl GyroflowPluginBaseInstance {
     pub fn stab_manager(&mut self, params: &mut dyn GyroflowPluginParams, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, out_size: (usize, usize), open_gyroflow_if_no_data: bool) -> PluginResult<Arc<StabilizationManager>> {
         let mut disable_stretch = params.get_bool(Params::DisableStretch)?;
 
-        Self::show_update_status(params);
         let instance_id = params.get_string(Params::InstanceId)?;
         let path = params.get_string(Params::ProjectPath)?;
         if path.is_empty() {
@@ -993,45 +992,36 @@ impl GyroflowPluginBaseInstance {
         }
     }
 
-    /// The update status line, filled in by background work and shown on the
-    /// next callback that has the parameters.
-    fn update_status() -> &'static std::sync::Mutex<String> {
-        static STATUS: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
-        STATUS.get_or_init(|| {
-            std::thread::spawn(|| { let s = update::check(false); *Self::update_status().lock().unwrap() = s; });
-            std::sync::Mutex::new(format!("fpSup v{}: checking...", update::RELEASE))
-        })
-    }
-
-    fn show_update_status(params: &mut dyn GyroflowPluginParams) {
-        let status = Self::update_status().lock().unwrap().clone();
-        if params.get_string(Params::UpdateStatus).unwrap_or_default() != status {
-            let _ = params.set_string(Params::UpdateStatus, &status);
-        }
-    }
-
-    fn run_update_job<F: FnOnce() -> String + Send + 'static>(params: &mut dyn GyroflowPluginParams, busy: &str, job: F) {
-        *Self::update_status().lock().unwrap() = busy.to_owned();
-        let _ = params.set_string(Params::UpdateStatus, busy);
-        std::thread::spawn(move || { let s = job(); *Self::update_status().lock().unwrap() = s; });
+    /// When an instance is created: the last update check's answer (no
+    /// network), and a background check that refreshes it at most once a day.
+    /// Parameters are written only here and from the update buttons: a host
+    /// may call back into the plugin from inside a parameter write, so the
+    /// status is never written from a general callback.
+    pub fn show_update_status(params: &mut dyn GyroflowPluginParams) {
+        static BACKGROUND: std::sync::Once = std::sync::Once::new();
+        BACKGROUND.call_once(|| { std::thread::spawn(|| { let _ = update::check(false); }); });
+        let _ = params.set_string(Params::UpdateStatus, &update::cached_status());
     }
 
     pub fn param_changed(&mut self, params: &mut dyn GyroflowPluginParams, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, param: Params, user_edited: bool) -> Result<(), Box<dyn std::error::Error>> {
-        Self::show_update_status(params);
-        if param == Params::CheckUpdate {
-            Self::run_update_job(params, "Checking GitHub...", || update::check(true));
+        if param == Params::UpdateStatus {
+            return Ok(());                    // our own write coming back
         }
-        if param == Params::InstallUpdate {
+        if param == Params::CheckUpdate && user_edited {
+            params.set_string(Params::UpdateStatus, &update::check(true))?;
+        }
+        if param == Params::InstallUpdate && user_edited {
             let wanted = params.get_string(Params::UpdateVersion).unwrap_or_default();
             let wanted = wanted.trim().trim_start_matches("fpsup-v").trim_start_matches('v').to_owned();
-            match (wanted.is_empty(), wanted.parse::<u32>()) {
-                (true, _) => Self::run_update_job(params, "Installing the newest release...", || update::install(None).unwrap_or_else(|e| format!("Install failed: {e}"))),
-                (false, Ok(n)) => Self::run_update_job(params, &format!("Installing fpsup-v{n}..."), move || update::install(Some(n)).unwrap_or_else(|e| format!("Install failed: {e}"))),
-                (false, Err(_)) => { params.set_string(Params::UpdateStatus, "Version to install: a release number, e.g. 3")?; }
-            }
+            let status = match (wanted.is_empty(), wanted.parse::<u32>()) {
+                (true, _) => update::install(None).unwrap_or_else(|e| format!("Install failed: {e}")),
+                (false, Ok(n)) => update::install(Some(n)).unwrap_or_else(|e| format!("Install failed: {e}")),
+                (false, Err(_)) => "Version to install: a release number, e.g. 3".to_owned(),
+            };
+            params.set_string(Params::UpdateStatus, &status)?;
         }
-        if param == Params::RollBack {
-            Self::run_update_job(params, "Rolling back...", || update::roll_back().unwrap_or_else(|e| format!("Roll back failed: {e}")));
+        if param == Params::RollBack && user_edited {
+            params.set_string(Params::UpdateStatus, &update::roll_back().unwrap_or_else(|e| format!("Roll back failed: {e}")))?;
         }
         if param == Params::Browse {
             let new_path = Self::browse(&params.get_string(Params::ProjectPath)?);

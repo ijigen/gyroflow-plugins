@@ -114,6 +114,24 @@ pub fn fetch_releases() -> Result<Vec<Release>, String> {
     parse_releases(&String::from_utf8_lossy(&body))
 }
 
+fn status_line(latest: Result<u32, String>) -> String {
+    match latest {
+        Ok(n) if n > RELEASE => format!("fpSup v{RELEASE}: v{n} is available (Install)"),
+        Ok(_) => format!("fpSup v{RELEASE}: up to date"),
+        Err(e) => format!("fpSup v{RELEASE}: update check failed ({e})"),
+    }
+}
+
+/// The last check's answer, without the network.
+pub fn cached_status() -> String {
+    let latest = std::fs::read_to_string(state_dir().join("last_check")).ok()
+        .and_then(|s| s.trim().split_once(' ').and_then(|(_, n)| n.parse::<u32>().ok()));
+    match latest {
+        Some(n) => status_line(Ok(n)),
+        None => format!("fpSup v{RELEASE}: not checked yet"),
+    }
+}
+
 /// A status line for the plugin: checks the network at most once a day unless
 /// `force`, remembering the answer in between.
 pub fn check(force: bool) -> String {
@@ -129,11 +147,7 @@ pub fn check(force: bool) -> String {
             let _ = std::fs::write(&stamp, format!("{} {latest}", now_s()));
         }),
     };
-    match latest {
-        Ok(n) if n > RELEASE => format!("fpSup v{RELEASE}: v{n} is available (Install)"),
-        Ok(_) => format!("fpSup v{RELEASE}: up to date"),
-        Err(e) => format!("fpSup v{RELEASE}: update check failed ({e})"),
-    }
+    status_line(latest)
 }
 
 fn sha256_of(path: &Path) -> Result<String, String> {
