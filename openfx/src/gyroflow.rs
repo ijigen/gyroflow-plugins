@@ -10,7 +10,7 @@ use gyroflow_plugin_base::lru::LruCache;
 plugin_module!(
     "io.github.ijigen.fpsup.gyroflow",
     ApiVersion(1),
-    PluginVersion(1, 7),
+    PluginVersion(1, 8),
     GyroflowPlugin::default
 );
 
@@ -42,8 +42,6 @@ define_params!(ParamHandler {
         LoadedProject       => loaded_project:   ParamHandle<String>,
         LoadedPreset        => loaded_preset:    ParamHandle<String>,
         LoadedLens          => loaded_lens:      ParamHandle<String>,
-        LensSearch          => lens_search:      ParamHandle<String>,
-        LensSearchResult    => lens_search_result: ParamHandle<String>,
         UpdateStatus        => update_status:    ParamHandle<String>,
         UpdateVersion       => update_version:   ParamHandle<String>,
     ],
@@ -78,7 +76,6 @@ define_params!(ParamHandler {
     i32s: [
         Interpolation         => interpolation:            ParamHandle<Int>,
         IntegrationMethod     => integration_method:       ParamHandle<Int>,
-        LensChoice            => lens_choice:              ParamHandle<Int>,
     ],
 
     get_string:  _s p    { Ok(p.get_value()?) },
@@ -470,9 +467,6 @@ impl Execute for GyroflowPlugin {
                         manual_focal_length:      param_set.parameter("ManualFocalLength")?,
                         manual_distortion:        param_set.parameter("ManualDistortion")?,
                         manual_distortion_auto:   param_set.parameter("ManualDistortionAuto")?,
-                        lens_search:              param_set.parameter("LensSearch")?,
-                        lens_choice:              param_set.parameter("LensChoice")?,
-                        lens_search_result:       param_set.parameter("LensSearchResult")?,
                         update_status:            param_set.parameter("UpdateStatus")?,
                         update_version:           param_set.parameter("UpdateVersion")?,
                         output_swap:              param_set.parameter("OutputSizeSwap")?,

@@ -7,8 +7,6 @@ use std::sync::{ Arc, atomic::AtomicBool };
 
 mod cdng;
 mod fsg2;
-mod lensdb;
-mod lensdb_fp_list;
 pub mod update;
 mod lensfit;
 
@@ -60,9 +58,6 @@ pub enum Params {
     ManualFocalLength,
     ManualDistortionAuto,
     ManualDistortion,
-    LensChoice,
-    LensSearch,
-    LensSearchResult,
     IntegrationMethod,
     KeyframesGroup, KeyframesGroupEnd,
     UseGyroflowsKeyframes,
@@ -283,7 +278,6 @@ impl GyroflowPluginBase {
     }
 
     pub fn get_param_definitions() -> [ParameterType; 15] {
-        let lens_menu = lensdb::menu();
         [
             ParameterType::HiddenString { id: "InstanceId" },
             ParameterType::HiddenString { id: "ProjectPath" },
@@ -303,9 +297,6 @@ impl GyroflowPluginBase {
                 ParameterType::Slider   { id: "ManualFocalLength",      label: "Manual lens focal (mm)", hint: "SIGMA fp CinemaDNG with a lens without electronic contacts: its focal length in mm (0 = none). Ignored when the frames carry lens data.", min: 0.0, max: 1000.0, default: 0.0 },
                 ParameterType::Checkbox { id: "ManualDistortionAuto",   label: "Typical distortion for focal", hint: "With a manual lens focal: the barrel typical of that focal length (from Gyroflow's lens database). Off: use Corner distortion.", default: true },
                 ParameterType::Slider   { id: "ManualDistortion",       label: "Corner distortion (%)", hint: "With a manual lens focal and Typical distortion off: the frame corner against an ideal lens. Negative = barrel, positive = pincushion, 0 = none.", min: -30.0, max: 10.0, default: 0.0 },
-                ParameterType::Select   { id: "LensChoice",             label: "Lens profile (fp)", hint: "SIGMA fp: a lens profile from Gyroflow's lens database (the fp ones). Wins over the search and the manual focal.", options: lens_menu, default: "(none)" },
-                ParameterType::TextBox  { id: "LensSearch",             label: "Lens profile search (fp)", hint: "SIGMA fp: type a lens name (e.g. helios 44) and press Enter to take its profile from Gyroflow's lens database; empty clears it." },
-                ParameterType::Text     { id: "LensSearchResult",       label: "Search result",   hint: "The lens profile the search took, or why none" },
             ] },
             ParameterType::Group { id: "AdjustGroup", label: "Adjust parameters", opened: true, parameters: vec![
                 ParameterType::Slider   { id: "Smoothness",             label: "Smoothness",           hint: "Smoothness",                   min: 1.0,    max: 300.0, default: 50.0 },
@@ -588,9 +579,7 @@ impl GyroflowPluginBaseInstance {
         let manual_focal = params.get_f64(Params::ManualFocalLength).unwrap_or(0.0);
         let manual_corner = (!params.get_bool(Params::ManualDistortionAuto).unwrap_or(true))
             .then(|| params.get_f64(Params::ManualDistortion).unwrap_or(0.0) / 100.0);
-        let lens_query = params.get_string(Params::LensSearch).unwrap_or_default();
-        let lens_choice = params.get_i32(Params::LensChoice).unwrap_or(0).max(0) as usize;
-        let key = format!("{path}{disable_stretch}{manual_focal}{manual_corner:?}{lens_query}{lens_choice}{instance_id}");
+        let key = format!("{path}{disable_stretch}{manual_focal}{manual_corner:?}{instance_id}");
         let cloned = manager_cache.lock().get(&key).map(Arc::clone);
         let stab = if let Some(stab) = cloned {
             // Cache it in this instance as well
@@ -701,35 +690,8 @@ impl GyroflowPluginBaseInstance {
                             stab.params.write().output_size = preset_out_size;
                         }
 
-                        // An fp lens profile searched by name: read here, at load, so it
-                        // works whether or not the host reported the edit; it takes the
-                        // place of an embedded profile.
-                        let mut searched = false;
-                        if let Some((label, json)) = lensdb::menu_profile(lens_choice) {
-                            if stab.load_lens_profile(&json).is_ok() {
-                                searched = true;
-                                let _ = params.set_string(Params::LoadedLens, label);
-                                let _ = params.set_string(Params::LensSearchResult, &format!("Using (menu): {label}"));
-                            }
-                        } else if !lens_query.trim().is_empty() {
-                            let width = stab.params.read().size.0;
-                            match lensdb::find_fp_profile(&lens_query, width) {
-                                Some((label, json)) => {
-                                    if stab.load_lens_profile(&json).is_ok() {
-                                        searched = true;
-                                        let _ = params.set_string(Params::LoadedLens, &label);
-                                        let _ = params.set_string(Params::LensSearchResult, &format!("Using: {label}"));
-                                    }
-                                }
-                                None => {
-                                    let _ = params.set_string(Params::LensSearchResult, &format!("No SIGMA fp profile for \"{}\": use Manual lens focal", lens_query.trim()));
-                                }
-                            }
-                        } else if params.get_string(Params::LensSearchResult).is_ok_and(|s| !s.is_empty()) {
-                            let _ = params.set_string(Params::LensSearchResult, "");
-                        }
                         if let Ok(d) = params.get_string(Params::EmbeddedLensProfile) {
-                            if !d.is_empty() && !searched {
+                            if !d.is_empty() {
                                 if let Err(e) = stab.load_lens_profile(&d) {
                                     rfd::MessageDialog::new()
                                         .set_description(&format!("Failed to load lens profile: {e:?}"))
@@ -1042,8 +1004,8 @@ impl GyroflowPluginBaseInstance {
     }
 
     pub fn param_changed(&mut self, params: &mut dyn GyroflowPluginParams, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, param: Params, user_edited: bool) -> Result<(), Box<dyn std::error::Error>> {
-        if param == Params::UpdateStatus || param == Params::LensSearchResult {
-            return Ok(());                    // our own writes coming back
+        if param == Params::UpdateStatus {
+            return Ok(());                    // our own write coming back
         }
         if param == Params::CheckUpdate && user_edited {
             params.set_string(Params::UpdateStatus, &update::check(true))?;
@@ -1088,11 +1050,6 @@ impl GyroflowPluginBaseInstance {
                     self.clear_stab(&manager_cache);
                 }
             }
-        }
-        if param == Params::LensSearch || param == Params::LensChoice {
-            // Applied where the clip loads (stab_manager): some hosts (Resolve's
-            // Fusion page) never report this edit, so nothing may hang on it here.
-            self.clear_stab(&manager_cache);
         }
         if param == Params::OpenGyroflow {
             GyroflowPluginBase::open_gyroflow(params.get_string(Params::ProjectPath).ok().as_deref());
