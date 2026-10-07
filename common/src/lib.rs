@@ -40,6 +40,7 @@ pub enum Params {
     ReloadProject,
     OpenRecentProject,
     Status,
+    LensGroup, LensGroupEnd,
     AdjustGroup, AdjustGroupEnd,
     Fov,
     Smoothness,
@@ -278,7 +279,7 @@ impl GyroflowPluginBase {
         }
     }
 
-    pub fn get_param_definitions() -> [ParameterType; 14] {
+    pub fn get_param_definitions() -> [ParameterType; 15] {
         [
             ParameterType::HiddenString { id: "InstanceId" },
             ParameterType::HiddenString { id: "ProjectPath" },
@@ -293,6 +294,12 @@ impl GyroflowPluginBase {
                 ParameterType::Button  { id: "OpenGyroflow",      label: "Open Gyroflow",            hint: "Open project in Gyroflow" },
                 ParameterType::Button  { id: "ReloadProject",     label: "Reload project",           hint: "Reload currently loaded project" },
                 ParameterType::Button  { id: "OpenRecentProject", label: "Last saved project",       hint: "Load most recently saved project in the Gyroflow app" },
+            ] },
+            ParameterType::Group { id: "LensGroup", label: "fpSup lens", opened: true, parameters: vec![
+                ParameterType::Slider   { id: "ManualFocalLength",      label: "Manual lens focal (mm)", hint: "SIGMA fp CinemaDNG with a lens without electronic contacts: its focal length in mm (0 = none). Ignored when the frames carry lens data.", min: 0.0, max: 1000.0, default: 0.0 },
+                ParameterType::Checkbox { id: "ManualDistortionAuto",   label: "Typical distortion for focal", hint: "With a manual lens focal: the barrel typical of that focal length (from Gyroflow's lens database). Off: use Corner distortion.", default: true },
+                ParameterType::Slider   { id: "ManualDistortion",       label: "Corner distortion (%)", hint: "With a manual lens focal and Typical distortion off: the frame corner against an ideal lens. Negative = barrel, positive = pincushion, 0 = none.", min: -30.0, max: 10.0, default: 0.0 },
+                ParameterType::TextBox  { id: "LensSearch",             label: "Lens profile search (fp)", hint: "SIGMA fp: type a lens name (e.g. helios 44) to take its profile from Gyroflow's lens database; empty clears it." },
             ] },
             ParameterType::Group { id: "AdjustGroup", label: "Adjust parameters", opened: true, parameters: vec![
                 ParameterType::Slider   { id: "Smoothness",             label: "Smoothness",           hint: "Smoothness",                   min: 1.0,    max: 300.0, default: 50.0 },
@@ -309,10 +316,6 @@ impl GyroflowPluginBase {
                 ParameterType::Slider   { id: "Fov",                    label: "FOV",                  hint: "FOV",                          min: 0.1,    max: 3.0,   default: 1.0 },
                 ParameterType::Slider   { id: "VideoSpeed",             label: "Video speed",          hint: "Use this slider to change video speed or keyframe it, instead of built-in speed changes in the editor", min: 0.0001, max: 1000.0, default: 100.0 },
                 ParameterType::Checkbox { id: "DisableStretch",         label: "Disable Gyroflow's stretch", hint: "If you used Input stretch in the lens profile in Gyroflow, and you de-stretched the video separately in your editor (by setting anamorphic squeeze factor), check this to disable Gyroflow's internal stretching.", default: false },
-                ParameterType::Slider   { id: "ManualFocalLength",      label: "Manual lens focal (mm)", hint: "SIGMA fp CinemaDNG with a lens without electronic contacts: its focal length in mm (0 = none). Ignored when the frames carry lens data.", min: 0.0, max: 1000.0, default: 0.0 },
-                ParameterType::Checkbox { id: "ManualDistortionAuto",   label: "Typical distortion for focal", hint: "With a manual lens focal: the barrel typical of that focal length (from Gyroflow's lens database). Off: use Corner distortion.", default: true },
-                ParameterType::Slider   { id: "ManualDistortion",       label: "Corner distortion (%)", hint: "With a manual lens focal and Typical distortion off: the frame corner against an ideal lens. Negative = barrel, positive = pincushion, 0 = none.", min: -30.0, max: 10.0, default: 0.0 },
-                ParameterType::TextBox  { id: "LensSearch",             label: "Lens profile search (fp)", hint: "SIGMA fp: type a lens name (e.g. helios 44) to take its profile from Gyroflow's lens database; empty clears it." },
                 ParameterType::Select   { id: "IntegrationMethod",      label: "Integration method",   hint: "IMU integration method", options: vec!["None", "Complementary", "VQF", "Simple gyro", "Simple gyro + accel", "Mahony", "Madgwick"], default: "VQF" },
                 //ParameterType::Slider   { id: "FusionStartFrame",       label: "Fusion Start Frame",   hint: "Fusion Start Frame (from Project Settings)", min: 0.0, max: 100000.0, default: 0.0 },
             ] },
