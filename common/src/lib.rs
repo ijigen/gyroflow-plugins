@@ -340,7 +340,7 @@ impl GyroflowPluginBase {
             ParameterType::Group { id: "UpdateGroup", label: "fpSup plugin", opened: false, parameters: vec![
                 ParameterType::Text    { id: "UpdateStatus",  label: "Update status",      hint: "This plugin's release and the newest on GitHub (checked once a day)" },
                 ParameterType::Button  { id: "CheckUpdate",   label: "Check for update",   hint: "Ask GitHub now" },
-                ParameterType::TextBox { id: "UpdateVersion", label: "Version to install", hint: "Empty: the newest release. A number: that release (fpsup-vN), newer or older" },
+                ParameterType::TextBox { id: "UpdateVersion", label: "Version to install", hint: "Empty: the newest release. A version (e.g. 0.1.0): that release, newer or older" },
                 ParameterType::Button  { id: "InstallUpdate", label: "Install",            hint: "Download, check its SHA-256, keep the installed one as a backup, install. Restart the editor to load it" },
                 ParameterType::Button  { id: "RollBack",      label: "Roll back",          hint: "Put the previous installation back (no network). Restart the editor to load it" },
             ] },
@@ -1013,10 +1013,10 @@ impl GyroflowPluginBaseInstance {
         if param == Params::InstallUpdate && user_edited {
             let wanted = params.get_string(Params::UpdateVersion).unwrap_or_default();
             let wanted = wanted.trim().trim_start_matches("fpsup-v").trim_start_matches('v').to_owned();
-            let status = match (wanted.is_empty(), wanted.parse::<u32>()) {
+            let status = match (wanted.is_empty(), update::parse_version(&wanted)) {
                 (true, _) => update::install(None).unwrap_or_else(|e| format!("Install failed: {e}")),
-                (false, Ok(n)) => update::install(Some(n)).unwrap_or_else(|e| format!("Install failed: {e}")),
-                (false, Err(_)) => "Version to install: a release number, e.g. 3".to_owned(),
+                (false, Some(n)) => update::install(Some(n)).unwrap_or_else(|e| format!("Install failed: {e}")),
+                (false, None) => "Version to install: a release number, e.g. 0.1.0".to_owned(),
             };
             params.set_string(Params::UpdateStatus, &status)?;
         }

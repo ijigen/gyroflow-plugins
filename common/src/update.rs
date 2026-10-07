@@ -1,7 +1,7 @@
 //! Updating the fpSup OpenFX plugin from the fork's GitHub releases, and going
 //! back.
 //!
-//! Releases are tagged `fpsup-vN`; this build is `RELEASE`. Each release
+//! Releases are tagged `fpsup-vX.Y.Z`; this build is `RELEASE`. Each release
 //! carries the platform zips and a `SHA256SUMS` file. Installing any release
 //! (newer or older) first moves the installed bundle into a backup folder, so
 //! "roll back" can put the previous one back without the network, and every
@@ -12,8 +12,28 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// This build. Bump it with each `fpsup-vN` tag.
-pub const RELEASE: u32 = 1;
+/// This build. Bump it with each `fpsup-vX.Y.Z` tag.
+pub const RELEASE: &str = "0.1.0";
+
+/// A release number, compared part by part: 0.1.10 is after 0.1.9.
+pub type Version = (u32, u32, u32);
+
+/// "0.1.0" (also "0.1", "2", with or without "fpsup-v" or "v") -> (0, 1, 0).
+pub fn parse_version(text: &str) -> Option<Version> {
+    let t = text.trim();
+    let t = t.strip_prefix(TAG_PREFIX).or_else(|| t.strip_prefix('v')).unwrap_or(t);
+    let mut parts = t.split('.').map(|p| p.parse::<u32>());
+    let v = (parts.next()?.ok()?, parts.next().unwrap_or(Ok(0)).ok()?, parts.next().unwrap_or(Ok(0)).ok()?);
+    parts.next().is_none().then_some(v)
+}
+
+pub fn show(v: Version) -> String {
+    format!("{}.{}.{}", v.0, v.1, v.2)
+}
+
+fn this_build() -> Version {
+    parse_version(RELEASE).expect("RELEASE is a version")
+}
 pub const REPO: &str = "ijigen/gyroflow-plugins";
 const TAG_PREFIX: &str = "fpsup-v";
 const BUNDLE: &str = "fpSupGyroflow.ofx.bundle";
@@ -21,15 +41,15 @@ const CHECK_EVERY_S: u64 = 24 * 3600;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Release {
-    pub number: u32,
+    pub number: Version,
     pub tag: String,
     /// (asset name, download url)
     pub assets: Vec<(String, String)>,
 }
 
-/// `fpsup-v12` -> 12.
-pub fn release_number(tag: &str) -> Option<u32> {
-    tag.strip_prefix(TAG_PREFIX)?.parse().ok()
+/// `fpsup-v0.1.2` -> (0, 1, 2); other tags (the upstream plugin's) -> None.
+pub fn release_number(tag: &str) -> Option<Version> {
+    tag.strip_prefix(TAG_PREFIX).and_then(parse_version)
 }
 
 /// The fpSup releases in a GitHub `/releases` listing, newest first.
@@ -114,9 +134,9 @@ pub fn fetch_releases() -> Result<Vec<Release>, String> {
     parse_releases(&String::from_utf8_lossy(&body))
 }
 
-fn status_line(latest: Result<u32, String>) -> String {
+fn status_line(latest: Result<Option<Version>, String>) -> String {
     match latest {
-        Ok(n) if n > RELEASE => format!("fpSup v{RELEASE}: v{n} is available (Install)"),
+        Ok(Some(n)) if n > this_build() => format!("fpSup v{RELEASE}: v{} is available (Install)", show(n)),
         Ok(_) => format!("fpSup v{RELEASE}: up to date"),
         Err(e) => format!("fpSup v{RELEASE}: update check failed ({e})"),
     }
@@ -125,7 +145,7 @@ fn status_line(latest: Result<u32, String>) -> String {
 /// The last check's answer, without the network.
 pub fn cached_status() -> String {
     let latest = std::fs::read_to_string(state_dir().join("last_check")).ok()
-        .and_then(|s| s.trim().split_once(' ').and_then(|(_, n)| n.parse::<u32>().ok()));
+        .and_then(|s| s.trim().split_once(' ').map(|(_, n)| parse_version(n)));
     match latest {
         Some(n) => status_line(Ok(n)),
         None => format!("fpSup v{RELEASE}: not checked yet"),
@@ -138,13 +158,13 @@ pub fn check(force: bool) -> String {
     let stamp = state_dir().join("last_check");
     let cached = std::fs::read_to_string(&stamp).ok().and_then(|s| {
         let (when, latest) = s.trim().split_once(' ')?;
-        Some((when.parse::<u64>().ok()?, latest.parse::<u32>().ok()?))
+        Some((when.parse::<u64>().ok()?, parse_version(latest)))
     });
     let latest = match cached {
         Some((when, latest)) if !force && now_s().saturating_sub(when) < CHECK_EVERY_S => Ok(latest),
-        _ => fetch_releases().map(|r| r.first().map_or(0, |r| r.number)).inspect(|latest| {
+        _ => fetch_releases().map(|r| r.first().map(|r| r.number)).inspect(|latest| {
             let _ = std::fs::create_dir_all(state_dir());
-            let _ = std::fs::write(&stamp, format!("{} {latest}", now_s()));
+            let _ = std::fs::write(&stamp, format!("{} {}", now_s(), latest.map_or("none".to_owned(), show)));
         }),
     };
     status_line(latest)
@@ -209,10 +229,10 @@ fn swap_in_at(plugins: &Path, backups: &Path, new_bundle: &Path, label: &str) ->
 
 /// Install release `number` (any, newer or older), or the newest when `None`.
 /// The running editor keeps the loaded copy; the new one loads on restart.
-pub fn install(number: Option<u32>) -> Result<String, String> {
+pub fn install(number: Option<Version>) -> Result<String, String> {
     let releases = fetch_releases()?;
     let release = match number {
-        Some(n) => releases.iter().find(|r| r.number == n).ok_or_else(|| format!("no release fpsup-v{n}"))?,
+        Some(n) => releases.iter().find(|r| r.number == n).ok_or_else(|| format!("no release fpsup-v{}", show(n)))?,
         None => releases.first().ok_or("no fpSup release yet")?,
     };
     let url_of = |name: &str| release.assets.iter().find(|(a, _)| a == name).map(|(_, u)| u.clone());
@@ -287,16 +307,22 @@ mod tests {
     #[test]
     fn releases_are_read_newest_first_and_others_ignored() {
         let json = r#"[
-            {"tag_name": "fpsup-v2", "draft": false, "assets": [{"name": "SHA256SUMS", "browser_download_url": "https://x/s"}]},
+            {"tag_name": "fpsup-v0.1.2", "draft": false, "assets": [{"name": "SHA256SUMS", "browser_download_url": "https://x/s"}]},
             {"tag_name": "v2.1.1", "draft": false, "assets": []},
-            {"tag_name": "fpsup-v10", "draft": false, "assets": [{"name": "fpSupGyroflow-OpenFX-macos.zip", "browser_download_url": "https://x/m"}]},
-            {"tag_name": "fpsup-v11", "draft": true, "assets": []}
+            {"tag_name": "fpsup-v0.1.10", "draft": false, "assets": [{"name": "fpSupGyroflow-OpenFX-macos.zip", "browser_download_url": "https://x/m"}]},
+            {"tag_name": "fpsup-v0.1.11", "draft": true, "assets": []}
         ]"#;
         let r = parse_releases(json).unwrap();
-        assert_eq!(r.iter().map(|r| r.number).collect::<Vec<_>>(), vec![10, 2]);
+        assert_eq!(r.iter().map(|r| r.number).collect::<Vec<_>>(), vec![(0, 1, 10), (0, 1, 2)]);
         assert_eq!(r[0].assets[0].0, "fpSupGyroflow-OpenFX-macos.zip");
-        assert_eq!(release_number("fpsup-v3"), Some(3));
+        assert_eq!(release_number("fpsup-v0.2.0"), Some((0, 2, 0)));
         assert_eq!(release_number("fpsup-vx"), None);
+        assert_eq!(release_number("v2.1.1"), None, "the upstream plugin's tags are not ours");
+        assert_eq!(parse_version("0.1"), Some((0, 1, 0)));
+        assert_eq!(parse_version("fpsup-v1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_version("1.2.3.4"), None);
+        assert!(parse_version("0.1.10") > parse_version("0.1.9"));
+        assert_eq!(this_build(), parse_version(RELEASE).unwrap());
         assert!(parse_releases("{}").is_err());
     }
 

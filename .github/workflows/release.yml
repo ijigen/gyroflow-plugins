@@ -49,7 +49,7 @@ jobs:
         if: ${{ matrix.targets.type == 'windows' }}
         run: |
           just install-deps
-          just -f openfx/Justfile deploy
+          just ofx deploy
 
       - name: Build plugins (macOS)
         if: ${{ matrix.targets.type == 'macos' }}
@@ -57,7 +57,7 @@ jobs:
           SIGNING_FINGERPRINT: ${{ secrets.MACOS_CERTIFICATE_FINGERPRINT }}
         run: |
           just install-deps
-          just -f openfx/Justfile deploy
+          just ofx deploy
           if [ "$HAS_MAC_CERT" = "true" ]; then
             xcrun notarytool submit --wait --apple-id ${{ secrets.MACOS_ACCOUNT_USER }} --team-id ${{ secrets.MACOS_TEAM }} --password ${{ secrets.MACOS_ACCOUNT_PASS }} ${{ github.workspace }}/target/fpSupGyroflow-OpenFX-macos.dmg
             xcrun stapler staple --verbose ${{ github.workspace }}/target/fpSupGyroflow-OpenFX-macos.dmg
@@ -77,7 +77,7 @@ jobs:
             cargo install just
             cd ${{ github.workspace }}
             just install-deps
-            just -f openfx/Justfile deploy
+            just ofx deploy
           "
           sudo chown -R $(id -u):$(id -g) $HOME/.cargo
           sudo chown -R $(id -u):$(id -g) ${{ github.workspace }}/target
