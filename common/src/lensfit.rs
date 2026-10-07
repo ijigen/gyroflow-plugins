@@ -53,15 +53,17 @@ pub fn focal_px(frame_w: u32, focal_mm: f64, covered_cols: u16) -> f64 {
 /// corner against the ideal lens: under 15 mm -1.8 %, 15-24 mm -3.0 %,
 /// 24-35 mm -3.3 %, 35-60 mm -1.1 %, from 60 mm -0.2 % (spread under 24 mm
 /// is wide: a calibrated profile does better there).
-pub fn generic_rectilinear(focal_mm: f64, width: u32, height: u32, fx: f64) -> [f64; 4] {
+/// `corner` overrides the typical barrel: the corner's distortion against the
+/// ideal lens as a fraction (-0.05 = 5 % barrel, 0 = the ideal lens).
+pub fn generic_rectilinear(focal_mm: f64, width: u32, height: u32, fx: f64, corner: Option<f64>) -> [f64; 4] {
     let mut k = [1.0 / 3.0, 2.0 / 15.0, 17.0 / 315.0, 62.0 / 2835.0];
-    let barrel = match focal_mm {
+    let barrel = corner.unwrap_or(match focal_mm {
         f if f < 15.0 => -0.018,
         f if f < 24.0 => -0.030,
         f if f < 35.0 => -0.033,
         f if f < 60.0 => -0.011,
         _ => -0.002,
-    };
+    });
     let corner = (width as f64).hypot(height as f64) / 2.0 / fx;  // tan of the corner angle
     let t = corner.atan();
     let ideal = t * (1.0 + k[0] * t.powi(2) + k[1] * t.powi(4) + k[2] * t.powi(6) + k[3] * t.powi(8));
@@ -208,12 +210,16 @@ mod tests {
     fn the_generic_lens_is_rectilinear_with_the_typical_corner_barrel() {
         let theta_d = |t: f64, k: &[f64; 4]| t * (1.0 + k[0] * t * t + k[1] * t.powi(4) + k[2] * t.powi(6) + k[3] * t.powi(8));
         let fx = 1600.0;
-        let k = generic_rectilinear(50.0, 1920, 1080, fx);
+        let k = generic_rectilinear(50.0, 1920, 1080, fx, None);
         let t = (1920.0f64.hypot(1080.0) / 2.0 / fx).atan();
         // the corner: 1.1 % barrel against the ideal series (itself tan to 0.1 %)
         let ideal = [1.0 / 3.0, 2.0 / 15.0, 17.0 / 315.0, 62.0 / 2835.0];
         assert!((theta_d(t, &k) / theta_d(t, &ideal) - (1.0 - 0.011)).abs() < 1e-9);
         assert!((theta_d(t, &ideal) / t.tan() - 1.0).abs() < 1e-3);
+        // a set corner distortion replaces the typical one
+        let k = generic_rectilinear(50.0, 1920, 1080, fx, Some(-0.08));
+        assert!((theta_d(t, &k) / theta_d(t, &ideal) - (1.0 - 0.08)).abs() < 1e-9);
+        assert_eq!(generic_rectilinear(50.0, 1920, 1080, fx, Some(0.0)), ideal);
         // near the centre it is the ideal lens: theta_d = tan(theta)
         let s = 0.05;
         assert!((theta_d(s, &k) / s.tan() - 1.0).abs() < 1e-3);
