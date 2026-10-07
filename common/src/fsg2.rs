@@ -227,7 +227,53 @@ pub struct DngInfo {
 /// Samples are deduplicated by global index, so guard samples that two
 /// neighbouring blocks share are emitted once and a dropped block leaves a gap
 /// rather than a shift. The accelerometer is sample-and-hold from level events.
+/// How a take is turned into Gyroflow's messages.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Options {
+    /// Place frames on a regular grid fitted to the frame hooks instead of at
+    /// each hook. The sensor exposes on a fixed clock, but the hook runs when
+    /// the recording task gets to it, a few milliseconds late by a varying
+    /// amount (rms 1.8 ms at 29.97p, 2.9 ms at 59.94p on 2026-10-06 takes).
+    pub regular_frame_timing: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self { Self { regular_frame_timing: true } }
+}
+
 pub fn to_messages(frames: &[(Record, DngInfo)]) -> Result<Vec<gyroflow_proto::Main>, String> {
+    to_messages_with(frames, &Options::default())
+}
+
+/// Each frame's hook position, in samples from the take's start: as recorded,
+/// or on the line through them whose slope is the nominal samples per frame.
+/// The line keeps the hooks' mean, so HOOK_TO_READOUT_US still applies. Falls
+/// back to the recorded positions when the hooks do not follow the frame rate
+/// (fewer than three frames, or a fitted slope off by more than 1 %).
+pub fn frame_positions(frames: &[(Record, DngInfo)], fps: f64, regular: bool) -> Vec<f64> {
+    let hooks: Vec<f64> = frames.iter().map(|(r, _)| r.base_idx as f64 + r.frame_mark as f64).collect();
+    if !regular || frames.len() < 3 || !(fps > 0.0) {
+        return hooks;
+    }
+    let period_s = frames[0].0.sample_period_ps as f64 * 1e-12;
+    if !(period_s > 0.0) {
+        return hooks;
+    }
+    let per_frame = 1.0 / (fps * period_s);
+    let seqs: Vec<f64> = frames.iter().map(|(r, _)| r.frame_seq as f64).collect();
+    let n = seqs.len() as f64;
+    let (ms, mh) = (seqs.iter().sum::<f64>() / n, hooks.iter().sum::<f64>() / n);
+    let sxx: f64 = seqs.iter().map(|s| (s - ms).powi(2)).sum();
+    let sxy: f64 = seqs.iter().zip(&hooks).map(|(s, h)| (s - ms) * (h - mh)).sum();
+    if !(sxx > 0.0) || ((sxy / sxx) / per_frame - 1.0).abs() > 0.01 {
+        log::warn!("Frame hooks do not follow {fps:.3} fps; keeping each frame at its hook.");
+        return hooks;
+    }
+    let intercept = mh - per_frame * ms;
+    seqs.iter().map(|s| intercept + per_frame * s).collect()
+}
+
+pub fn to_messages_with(frames: &[(Record, DngInfo)], options: &Options) -> Result<Vec<gyroflow_proto::Main>, String> {
     let (first, first_dng) = frames.first().ok_or("no kind 2 frames")?;
     let (width, height) = first_dng.frame_size
         .ok_or("first DNG has no DefaultCropSize; cannot size the clip")?;
@@ -307,12 +353,13 @@ pub fn to_messages(frames: &[(Record, DngInfo)]) -> Result<Vec<gyroflow_proto::M
     // reach fall back to their own WarpRectilinear opcode.
     let lens_table = frames.iter().find_map(|(record, _)| record.lens_table.as_ref());
 
+    let positions = frame_positions(frames, fps, options.regular_frame_timing);
     let mut next_global: u64 = 0;
     let mut messages = Vec::with_capacity(frames.len());
     for (index, (record, dng)) in frames.iter().enumerate() {
         let base = record.base_idx as u64;
         let time_of = |position: u64| (base + position) as f64 * period_us;
-        let start = time_of(record.frame_mark as u64) + HOOK_TO_READOUT_US;
+        let start = positions[index] * period_us + HOOK_TO_READOUT_US;
 
         // Level events in this block, by position, to hold the accelerometer.
         let mut levels: Vec<(u64, [f32; 3])> = record.events.iter()
@@ -558,6 +605,39 @@ mod tests {
         let mut zero_period = record(0, 0, vec![]);
         zero_period.sample_period_ps = 0;
         assert!(parse(&encode(&zero_period)).unwrap_err().contains("period is zero"));
+    }
+
+    #[test]
+    fn regular_timing_puts_jittered_hooks_back_on_the_frame_clock() {
+        // 29.97p: 83.40 samples a frame at 400.0854 us. Hooks land late by 0..30.
+        let per_frame = 1.0 / (30000.0 / 1001.0 * PERIOD_PS as f64 * 1e-12);
+        let late = [0u32, 30, 5, 22, 1, 17, 9, 28, 3, 12];
+        let frames: Vec<_> = late.iter().enumerate().map(|(k, d)| {
+            let hook = (250.0 + per_frame * k as f64).round() as u32 + d;
+            let mut r = record(hook - 4, k as u32, vec![[0, 0, 0]; 4]);
+            r.frame_mark = 4;
+            (r, dng())
+        }).collect();
+        let fps = 30000.0 / 1001.0;
+        let regular = frame_positions(&frames, fps, true);
+        let steps: Vec<f64> = regular.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(steps.iter().all(|s| (s - per_frame).abs() < 1e-9), "{steps:?}");
+        let hooks = frame_positions(&frames, fps, false);
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        assert!((mean(&regular) - mean(&hooks)).abs() < 1e-9, "the line keeps the hooks' mean");
+        assert_eq!(hooks[1], (250.0 + per_frame).round() + 30.0);
+        // A dropped stretch (frame_seq jumps) stays on the same clock.
+        let mut gap = frames.clone();
+        gap.drain(3..6);
+        let g = frame_positions(&gap, fps, true);
+        assert!((g[3] - g[2] - 4.0 * per_frame).abs() < 1e-9);
+        // Hooks that do not follow the frame rate are left as they are.
+        assert_eq!(frame_positions(&frames, 25.0, true), hooks);
+        // The messages use the line.
+        let messages = to_messages_with(&frames, &Options { regular_frame_timing: true }).unwrap();
+        let period_us = PERIOD_PS as f64 / 1e6;
+        let t1 = messages[1].frame.as_ref().unwrap().start_timestamp_us;
+        assert!((t1 - (regular[1] * period_us + HOOK_TO_READOUT_US)).abs() < 1e-6);
     }
 
     #[test]

@@ -53,6 +53,7 @@ pub enum Params {
     Rotation,
     VideoSpeed,
     DisableStretch,
+    RegularFrameTiming,
     IntegrationMethod,
     KeyframesGroup, KeyframesGroupEnd,
     UseGyroflowsKeyframes,
@@ -297,6 +298,7 @@ impl GyroflowPluginBase {
                 ParameterType::Slider   { id: "Fov",                    label: "FOV",                  hint: "FOV",                          min: 0.1,    max: 3.0,   default: 1.0 },
                 ParameterType::Slider   { id: "VideoSpeed",             label: "Video speed",          hint: "Use this slider to change video speed or keyframe it, instead of built-in speed changes in the editor", min: 0.0001, max: 1000.0, default: 100.0 },
                 ParameterType::Checkbox { id: "DisableStretch",         label: "Disable Gyroflow's stretch", hint: "If you used Input stretch in the lens profile in Gyroflow, and you de-stretched the video separately in your editor (by setting anamorphic squeeze factor), check this to disable Gyroflow's internal stretching.", default: false },
+                ParameterType::Checkbox { id: "RegularFrameTiming",     label: "Regular frame timing (fp)", hint: "SIGMA fp CinemaDNG: place frames on the sensor's regular frame clock instead of at each frame's recorded hook time, which runs a few milliseconds late by a varying amount.", default: true },
                 ParameterType::Select   { id: "IntegrationMethod",      label: "Integration method",   hint: "IMU integration method", options: vec!["None", "Complementary", "VQF", "Simple gyro", "Simple gyro + accel", "Mahony", "Madgwick"], default: "VQF" },
                 //ParameterType::Slider   { id: "FusionStartFrame",       label: "Fusion Start Frame",   hint: "Fusion Start Frame (from Project Settings)", min: 0.0, max: 100000.0, default: 0.0 },
             ] },
@@ -553,7 +555,8 @@ impl GyroflowPluginBaseInstance {
             self.timeline_size = out_size;
         }
 
-        let key = format!("{path}{disable_stretch}{instance_id}");
+        let regular_frame_timing = params.get_bool(Params::RegularFrameTiming).unwrap_or(true);
+        let key = format!("{path}{disable_stretch}{regular_frame_timing}{instance_id}");
         let cloned = manager_cache.lock().get(&key).map(Arc::clone);
         let stab = if let Some(stab) = cloned {
             // Cache it in this instance as well
@@ -592,7 +595,8 @@ impl GyroflowPluginBaseInstance {
 
             if !path.ends_with(".gyroflow") {
                 let cdng_sequence = if path.to_ascii_lowercase().ends_with(".dng") {
-                    match cdng::read_embedded_protobuf_sequence(std::path::Path::new(&path)) {
+                    let options = fsg2::Options { regular_frame_timing };
+                    match cdng::read_embedded_protobuf_sequence_with(std::path::Path::new(&path), &options) {
                         Ok(sequence) => Some(sequence),
                         Err(error) => {
                             self.update_loaded_state(params, false);
@@ -998,7 +1002,7 @@ impl GyroflowPluginBaseInstance {
                 params.set_string(Params::ProjectPath, &last_project)?;
             }
         }
-        if param == Params::ProjectPath || param == Params::ReloadProject || param == Params::DontDrawOutside {
+        if param == Params::ProjectPath || param == Params::ReloadProject || param == Params::DontDrawOutside || param == Params::RegularFrameTiming {
             if param == Params::ProjectPath || param == Params::ReloadProject {
                 self.reload_values_from_project = true;
             }

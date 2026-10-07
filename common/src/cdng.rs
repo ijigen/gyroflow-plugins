@@ -82,12 +82,16 @@ impl ByteOrder {
 /// This entry point intentionally does not search other IFDs or infer telemetry
 /// from ordinary CDNG metadata.
 pub fn read_embedded_protobuf_sequence(path: &Path) -> Result<SequenceData, String> {
+    read_embedded_protobuf_sequence_with(path, &fsg2::Options::default())
+}
+
+pub fn read_embedded_protobuf_sequence_with(path: &Path, options: &fsg2::Options) -> Result<SequenceData, String> {
     let paths = sequence_paths(path)?;
     let mut jsonl = Vec::new();
     let mut expected_header: Option<gyroflow_proto::Header> = None;
     let mut clip_properties = None;
 
-    let messages = read_messages(&paths)?;
+    let messages = read_messages(&paths, options)?;
     for (index, (frame_path, main)) in paths.iter().zip(messages).enumerate() {
 
         if main.magic_string != "GyroflowProtobuf" {
@@ -163,7 +167,7 @@ pub fn read_embedded_protobuf_sequence(path: &Path) -> Result<SequenceData, Stri
 /// Serialized-protobuf carriers decode frame by frame; kind 2 records are
 /// converted together, because samples are deduplicated and the accelerometer
 /// is held across frame boundaries. A take must use one carrier throughout.
-fn read_messages(paths: &[PathBuf]) -> Result<Vec<gyroflow_proto::Main>, String> {
+fn read_messages(paths: &[PathBuf], options: &fsg2::Options) -> Result<Vec<gyroflow_proto::Main>, String> {
     let mut protobuf = Vec::new();
     let mut gyro2 = Vec::new();
     for frame_path in paths {
@@ -178,7 +182,7 @@ fn read_messages(paths: &[PathBuf]) -> Result<Vec<gyroflow_proto::Main>, String>
     }
     match (protobuf.is_empty(), gyro2.is_empty()) {
         (_, true) => Ok(protobuf),
-        (true, false) => fsg2::to_messages(&gyro2),
+        (true, false) => fsg2::to_messages_with(&gyro2, options),
         (false, false) => Err("DNG sequence mixes serialized-protobuf frames with kind 2 frames".to_owned()),
     }
 }
