@@ -10,7 +10,7 @@ use gyroflow_plugin_base::lru::LruCache;
 plugin_module!(
     "io.github.ijigen.fpsup.gyroflow",
     ApiVersion(1),
-    PluginVersion(1, 4),
+    PluginVersion(1, 5),
     GyroflowPlugin::default
 );
 
@@ -43,6 +43,7 @@ define_params!(ParamHandler {
         LoadedPreset        => loaded_preset:    ParamHandle<String>,
         LoadedLens          => loaded_lens:      ParamHandle<String>,
         LensSearch          => lens_search:      ParamHandle<String>,
+        LensSearchResult    => lens_search_result: ParamHandle<String>,
         UpdateStatus        => update_status:    ParamHandle<String>,
         UpdateVersion       => update_version:   ParamHandle<String>,
     ],
@@ -469,6 +470,7 @@ impl Execute for GyroflowPlugin {
                         manual_distortion:        param_set.parameter("ManualDistortion")?,
                         manual_distortion_auto:   param_set.parameter("ManualDistortionAuto")?,
                         lens_search:              param_set.parameter("LensSearch")?,
+                        lens_search_result:       param_set.parameter("LensSearchResult")?,
                         update_status:            param_set.parameter("UpdateStatus")?,
                         update_version:           param_set.parameter("UpdateVersion")?,
                         output_swap:              param_set.parameter("OutputSizeSwap")?,

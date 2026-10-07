@@ -60,6 +60,7 @@ pub enum Params {
     ManualDistortionAuto,
     ManualDistortion,
     LensSearch,
+    LensSearchResult,
     IntegrationMethod,
     KeyframesGroup, KeyframesGroupEnd,
     UseGyroflowsKeyframes,
@@ -299,7 +300,8 @@ impl GyroflowPluginBase {
                 ParameterType::Slider   { id: "ManualFocalLength",      label: "Manual lens focal (mm)", hint: "SIGMA fp CinemaDNG with a lens without electronic contacts: its focal length in mm (0 = none). Ignored when the frames carry lens data.", min: 0.0, max: 1000.0, default: 0.0 },
                 ParameterType::Checkbox { id: "ManualDistortionAuto",   label: "Typical distortion for focal", hint: "With a manual lens focal: the barrel typical of that focal length (from Gyroflow's lens database). Off: use Corner distortion.", default: true },
                 ParameterType::Slider   { id: "ManualDistortion",       label: "Corner distortion (%)", hint: "With a manual lens focal and Typical distortion off: the frame corner against an ideal lens. Negative = barrel, positive = pincushion, 0 = none.", min: -30.0, max: 10.0, default: 0.0 },
-                ParameterType::TextBox  { id: "LensSearch",             label: "Lens profile search (fp)", hint: "SIGMA fp: type a lens name (e.g. helios 44) to take its profile from Gyroflow's lens database; empty clears it." },
+                ParameterType::TextBox  { id: "LensSearch",             label: "Lens profile search (fp)", hint: "SIGMA fp: type a lens name (e.g. helios 44) and press Enter to take its profile from Gyroflow's lens database; empty clears it." },
+                ParameterType::Text     { id: "LensSearchResult",       label: "Search result",   hint: "The lens profile the search took, or why none" },
             ] },
             ParameterType::Group { id: "AdjustGroup", label: "Adjust parameters", opened: true, parameters: vec![
                 ParameterType::Slider   { id: "Smoothness",             label: "Smoothness",           hint: "Smoothness",                   min: 1.0,    max: 300.0, default: 50.0 },
@@ -1007,8 +1009,8 @@ impl GyroflowPluginBaseInstance {
     }
 
     pub fn param_changed(&mut self, params: &mut dyn GyroflowPluginParams, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, param: Params, user_edited: bool) -> Result<(), Box<dyn std::error::Error>> {
-        if param == Params::UpdateStatus {
-            return Ok(());                    // our own write coming back
+        if param == Params::UpdateStatus || param == Params::LensSearchResult {
+            return Ok(());                    // our own writes coming back
         }
         if param == Params::CheckUpdate && user_edited {
             params.set_string(Params::UpdateStatus, &update::check(true))?;
@@ -1056,18 +1058,21 @@ impl GyroflowPluginBaseInstance {
         }
         if param == Params::LensSearch && user_edited {
             let query = params.get_string(Params::LensSearch).unwrap_or_default();
+            log::info!("lens search: {query:?}");
             if query.trim().is_empty() {
                 params.set_string(Params::EmbeddedLensProfile, "")?;
                 params.set_string(Params::LoadedLens, "")?;
+                params.set_string(Params::LensSearchResult, "")?;
             } else {
                 let width = params.get_f64(Params::OutputWidth).unwrap_or(3840.0) as usize;
                 match lensdb::find_fp_profile(&query, width) {
                     Some((label, json)) => {
                         params.set_string(Params::EmbeddedLensProfile, &json)?;
                         params.set_string(Params::LoadedLens, &label)?;
+                        params.set_string(Params::LensSearchResult, &format!("Using: {label}"))?;
                     }
                     None => {
-                        params.set_string(Params::LoadedLens, &format!("No SIGMA fp profile matches \"{}\"", query.trim()))?;
+                        params.set_string(Params::LensSearchResult, &format!("No SIGMA fp profile for \"{}\": use Manual lens focal", query.trim()))?;
                     }
                 }
             }
