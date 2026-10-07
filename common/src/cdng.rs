@@ -224,18 +224,24 @@ fn sequence_paths(first: &Path) -> Result<Vec<PathBuf>, String> {
     if first_path.file_name() != first.file_name() {
         return Err(format!("{}: selected DNG frame does not exist", first.display()));
     }
-    let mut expected = *numbered.first_key_value().expect("selected frame exists").0;
-    let mut paths = Vec::with_capacity(numbered.len());
-    for (number, path) in numbered {
-        if number != expected {
-            return Err(format!("DNG sequence is missing frame {expected} before {}", path.display()));
-        }
+    // The run of consecutive numbers that holds the selected frame: an editor
+    // splits a numbered sequence at a gap (frames the camera never wrote), and
+    // each part is a clip of its own. Each frame carries its own timing, so a
+    // part loads like a whole take.
+    let mut low = first_number;
+    while low > 0 && numbered.contains_key(&(low - 1)) {
+        low -= 1;
+    }
+    let mut paths = Vec::new();
+    for (_, path) in numbered.range(low..).take_while({
+        let mut expected = low;
+        move |(number, _)| { let ok = **number == expected; expected = expected.wrapping_add(1); ok }
+    }) {
+        let path = path.clone();
         if !path.is_file() {
             return Err(format!("{}: DNG frame is not a regular file", path.display()));
         }
         paths.push(path);
-        expected = expected.checked_add(1)
-            .ok_or_else(|| "DNG frame number overflow".to_owned())?;
     }
     Ok(paths)
 }
@@ -735,11 +741,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_gap_in_dng_numbering() {
+    fn a_gap_in_dng_numbering_splits_the_take_into_parts() {
         let dir = TestDir::new();
-        write_dng(&dir.frame(1), &message(1, true), ByteOrder::Little, 7);
-        write_dng(&dir.frame(3), &message(2, false), ByteOrder::Little, 7);
-        assert!(read_embedded_protobuf_sequence(&dir.frame(1)).unwrap_err().contains("missing frame 2"));
+        let per_frame = 83;
+        for (file, seq) in [(1, 0), (2, 1), (3, 2), (7, 6), (8, 7)] {      // files 4-6 never written
+            let record = gyro2_record(seq * per_frame, seq, per_frame as usize + 4);
+            write_fp_like_frame(&dir.frame(file), block(&fsg2::encode(&record), BLOCK_KIND_GYRO2));
+        }
+        assert_eq!(read_embedded_protobuf_sequence(&dir.frame(2)).unwrap().frame_count, 3);
+        assert_eq!(read_embedded_protobuf_sequence(&dir.frame(7)).unwrap().frame_count, 2);
     }
 
     #[test]
