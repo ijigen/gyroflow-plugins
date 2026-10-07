@@ -300,7 +300,19 @@ pub fn vd_frame_positions(frames: &[(Record, DngInfo)], fps: f64) -> Result<Vec<
     }).collect())
 }
 
+/// What the user sets for a take, beyond what the frames carry.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Options {
+    /// A lens without electronic contacts: the frames carry no focal length,
+    /// so this one (mm) sizes the camera matrix, with no distortion.
+    pub manual_focal_mm: Option<f64>,
+}
+
 pub fn to_messages(frames: &[(Record, DngInfo)]) -> Result<Vec<gyroflow_proto::Main>, String> {
+    to_messages_with(frames, &Options::default())
+}
+
+pub fn to_messages_with(frames: &[(Record, DngInfo)], options: &Options) -> Result<Vec<gyroflow_proto::Main>, String> {
     let (first, first_dng) = frames.first().ok_or("no kind 2 frames")?;
     let (width, height) = first_dng.frame_size
         .ok_or("first DNG has no DefaultCropSize; cannot size the clip")?;
@@ -422,7 +434,7 @@ pub fn to_messages(frames: &[(Record, DngInfo)]) -> Result<Vec<gyroflow_proto::M
         }
         for (_, value) in level_iter { held_accel = value; }
 
-        let lens = lens_data(lens_table, record, dng, width, height);
+        let lens = lens_data(lens_table, record, dng, width, height, options);
         let frame = gyroflow_proto::FrameMetadata {
             start_timestamp_us: start,
             end_timestamp_us: start + record.readout_ns as f64 / 1000.0,
@@ -451,8 +463,26 @@ pub fn to_messages(frames: &[(Record, DngInfo)]) -> Result<Vec<gyroflow_proto::M
 /// camera's correction data reaches this frame - the camera matrix and fisheye
 /// coefficients fitted for this frame's focus, so breathing and distortion
 /// follow a focus pull.
-fn lens_data(table: Option<&LensTable>, record: &Record, dng: &DngInfo, width: u32, height: u32) -> gyroflow_proto::LensData {
+fn lens_data(table: Option<&LensTable>, record: &Record, dng: &DngInfo, width: u32, height: u32, options: &Options) -> gyroflow_proto::LensData {
     let distance_mm = dng.subject_distance_m.map(|m| m * 1000.0);
+    // No focal length from the mount: a lens without electronic contacts. The
+    // camera's correction table may still be the last electronic lens's, so it
+    // and the opcode are not used; the user's focal length is, or nothing.
+    if !dng.focal_length_mm.is_some_and(|mm| mm.is_finite() && mm > 0.0) {
+        let mut lens = gyroflow_proto::LensData {
+            f_number: dng.f_number.map(|v| v as f32),
+            ..Default::default()
+        };
+        if let Some(mm) = options.manual_focal_mm.filter(|mm| mm.is_finite() && *mm > 0.0) {
+            let fx = lensfit::focal_px(width, mm, record.crop[2]) as f32;
+            lens.focal_length_mm = Some(mm as f32);
+            lens.camera_intrinsic_matrix = vec![fx, 0.0, width as f32 / 2.0, 0.0, fx, height as f32 / 2.0, 0.0, 0.0, 1.0];
+            lens.distortion = Some(gyroflow_proto::lens_data::Distortion::OpencvFisheye(gyroflow_proto::OpenCvFisheye {
+                coefficients: vec![0.0; 4],
+            }));
+        }
+        return lens;
+    }
     let (kr, focal_mm) = match table {
         Some(table) => (
             lensfit::interpolate(&table.axis, &table.nodes, distance_mm),
@@ -679,6 +709,26 @@ mod tests {
         // Without Vd the take is refused.
         for (r, _) in &mut frames { r.events.clear(); }
         assert!(vd_frame_positions(&frames, fps).unwrap_err().contains("no Vd"));
+    }
+
+    #[test]
+    fn a_lens_without_contacts_uses_the_manual_focal_or_nothing() {
+        // No focal length in the EXIF, but a stale table from the last electronic lens.
+        let mut first = record(0, 0, vec![[0, 0, 0]; 4]);
+        first.lens_table = Some(lumix_40_table());
+        let manual = DngInfo { frame_size: Some((1920, 1080)), focal_length_mm: None, ..dng() };
+        let frames = with_vd(vec![(first, manual.clone())]);
+        let lens = |options: &Options| to_messages_with(&frames, options).unwrap()[0].frame.as_ref().unwrap().lens.clone();
+        assert!(lens(&Options::default()).iter().all(|l| l.camera_intrinsic_matrix.is_empty()), "the stale table is not used");
+        let l = lens(&Options { manual_focal_mm: Some(50.0) });
+        let fx = l[0].camera_intrinsic_matrix[0];
+        let want = lensfit::focal_px(1920, 50.0, frames[0].0.crop[2]) as f32;
+        assert!((fx - want).abs() < 1e-3, "{fx} vs {want}");
+        assert_eq!(l[0].focal_length_mm, Some(50.0));
+        // An electronic lens ignores the manual focal.
+        let electronic = with_vd(vec![(record(0, 0, vec![[0, 0, 0]; 4]), DngInfo { focal_length_mm: Some(28.0), ..manual })]);
+        let l = to_messages_with(&electronic, &Options { manual_focal_mm: Some(50.0) }).unwrap()[0].frame.as_ref().unwrap().lens.clone();
+        assert_eq!(l[0].focal_length_mm, Some(28.0));
     }
 
     #[test]

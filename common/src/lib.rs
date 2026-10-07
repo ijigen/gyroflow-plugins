@@ -53,6 +53,7 @@ pub enum Params {
     Rotation,
     VideoSpeed,
     DisableStretch,
+    ManualFocalLength,
     IntegrationMethod,
     KeyframesGroup, KeyframesGroupEnd,
     UseGyroflowsKeyframes,
@@ -297,6 +298,7 @@ impl GyroflowPluginBase {
                 ParameterType::Slider   { id: "Fov",                    label: "FOV",                  hint: "FOV",                          min: 0.1,    max: 3.0,   default: 1.0 },
                 ParameterType::Slider   { id: "VideoSpeed",             label: "Video speed",          hint: "Use this slider to change video speed or keyframe it, instead of built-in speed changes in the editor", min: 0.0001, max: 1000.0, default: 100.0 },
                 ParameterType::Checkbox { id: "DisableStretch",         label: "Disable Gyroflow's stretch", hint: "If you used Input stretch in the lens profile in Gyroflow, and you de-stretched the video separately in your editor (by setting anamorphic squeeze factor), check this to disable Gyroflow's internal stretching.", default: false },
+                ParameterType::Slider   { id: "ManualFocalLength",      label: "Manual lens focal (mm)", hint: "SIGMA fp CinemaDNG with a lens without electronic contacts: its focal length in mm (0 = none). Ignored when the frames carry lens data.", min: 0.0, max: 1000.0, default: 0.0 },
                 ParameterType::Select   { id: "IntegrationMethod",      label: "Integration method",   hint: "IMU integration method", options: vec!["None", "Complementary", "VQF", "Simple gyro", "Simple gyro + accel", "Mahony", "Madgwick"], default: "VQF" },
                 //ParameterType::Slider   { id: "FusionStartFrame",       label: "Fusion Start Frame",   hint: "Fusion Start Frame (from Project Settings)", min: 0.0, max: 100000.0, default: 0.0 },
             ] },
@@ -553,7 +555,8 @@ impl GyroflowPluginBaseInstance {
             self.timeline_size = out_size;
         }
 
-        let key = format!("{path}{disable_stretch}{instance_id}");
+        let manual_focal = params.get_f64(Params::ManualFocalLength).unwrap_or(0.0);
+        let key = format!("{path}{disable_stretch}{manual_focal}{instance_id}");
         let cloned = manager_cache.lock().get(&key).map(Arc::clone);
         let stab = if let Some(stab) = cloned {
             // Cache it in this instance as well
@@ -592,8 +595,14 @@ impl GyroflowPluginBaseInstance {
 
             if !path.ends_with(".gyroflow") {
                 let cdng_sequence = if path.to_ascii_lowercase().ends_with(".dng") {
-                    match cdng::read_embedded_protobuf_sequence(std::path::Path::new(&path)) {
-                        Ok(sequence) => Some(sequence),
+                    let options = fsg2::Options { manual_focal_mm: (manual_focal > 0.0).then_some(manual_focal) };
+                    match cdng::read_embedded_protobuf_sequence_with(std::path::Path::new(&path), &options) {
+                        Ok(sequence) => {
+                            if sequence.lens_missing {
+                                params.set_string(Params::LoadedLens, "No lens data (manual lens?): set Manual lens focal, or load a lens profile")?;
+                            }
+                            Some(sequence)
+                        }
                         Err(error) => {
                             self.update_loaded_state(params, false);
                             params.set_string(Params::Status, "Failed to load CinemaDNG telemetry")?;
@@ -998,7 +1007,7 @@ impl GyroflowPluginBaseInstance {
                 params.set_string(Params::ProjectPath, &last_project)?;
             }
         }
-        if param == Params::ProjectPath || param == Params::ReloadProject || param == Params::DontDrawOutside {
+        if param == Params::ProjectPath || param == Params::ReloadProject || param == Params::DontDrawOutside || param == Params::ManualFocalLength {
             if param == Params::ProjectPath || param == Params::ReloadProject {
                 self.reload_values_from_project = true;
             }
