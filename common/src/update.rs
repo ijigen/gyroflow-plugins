@@ -1,0 +1,323 @@
+//! Updating the fpSup OpenFX plugin from the fork's GitHub releases, and going
+//! back.
+//!
+//! Releases are tagged `fpsup-vN`; this build is `RELEASE`. Each release
+//! carries the platform zips and a `SHA256SUMS` file. Installing any release
+//! (newer or older) first moves the installed bundle into a backup folder, so
+//! "roll back" can put the previous one back without the network, and every
+//! swap is itself undoable. Nothing is installed without the user pressing a
+//! button; the check only reports.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// This build. Bump it with each `fpsup-vN` tag.
+pub const RELEASE: u32 = 1;
+pub const REPO: &str = "ijigen/gyroflow-plugins";
+const TAG_PREFIX: &str = "fpsup-v";
+const BUNDLE: &str = "fpSupGyroflow.ofx.bundle";
+const CHECK_EVERY_S: u64 = 24 * 3600;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Release {
+    pub number: u32,
+    pub tag: String,
+    /// (asset name, download url)
+    pub assets: Vec<(String, String)>,
+}
+
+/// `fpsup-v12` -> 12.
+pub fn release_number(tag: &str) -> Option<u32> {
+    tag.strip_prefix(TAG_PREFIX)?.parse().ok()
+}
+
+/// The fpSup releases in a GitHub `/releases` listing, newest first.
+pub fn parse_releases(json: &str) -> Result<Vec<Release>, String> {
+    let list: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("release list: {e}"))?;
+    let mut out: Vec<Release> = list.as_array().ok_or("release list is not an array")?.iter().filter_map(|r| {
+        if r["draft"].as_bool() == Some(true) {
+            return None;
+        }
+        let tag = r["tag_name"].as_str()?.to_owned();
+        let number = release_number(&tag)?;
+        let assets = r["assets"].as_array()?.iter().filter_map(|a| {
+            Some((a["name"].as_str()?.to_owned(), a["browser_download_url"].as_str()?.to_owned()))
+        }).collect();
+        Some(Release { number, tag, assets })
+    }).collect();
+    out.sort_by(|a, b| b.number.cmp(&a.number));
+    Ok(out)
+}
+
+/// The zip for this platform.
+pub fn platform_asset() -> &'static str {
+    if cfg!(target_os = "macos") { "fpSupGyroflow-OpenFX-macos.zip" }
+    else if cfg!(target_os = "windows") { "fpSupGyroflow-OpenFX-windows.zip" }
+    else { "fpSupGyroflow-OpenFX-linux.zip" }
+}
+
+/// The digest listed for `name` in a `sha256sum` style file.
+pub fn digest_for(sums: &str, name: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let digest = parts.next()?;
+        let file = parts.next()?.trim_start_matches('*');
+        let file = file.rsplit(['/', '\\']).next().unwrap_or(file);
+        (file == name && digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())).then(|| digest.to_ascii_lowercase())
+    })
+}
+
+pub fn install_dir() -> PathBuf {
+    if cfg!(target_os = "macos") { PathBuf::from("/Library/OFX/Plugins") }
+    else if cfg!(target_os = "windows") { PathBuf::from(r"C:\Program Files\Common Files\OFX\Plugins") }
+    else { PathBuf::from("/usr/OFX/Plugins") }
+}
+
+fn state_dir() -> PathBuf {
+    gyroflow_core::settings::data_dir().join("fpsup-plugin")
+}
+
+pub fn backup_dir() -> PathBuf {
+    state_dir().join("backups")
+}
+
+/// Backups, newest first: folders named `<unix seconds>-v<release>`.
+pub fn backups() -> Vec<(u64, String, PathBuf)> {
+    backups_in(&backup_dir())
+}
+
+fn backups_in(dir: &Path) -> Vec<(u64, String, PathBuf)> {
+    let mut out: Vec<(u64, String, PathBuf)> = std::fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let (secs, label) = name.split_once('-')?;
+        Some((secs.parse().ok()?, label.to_owned(), e.path()))
+    }).filter(|(_, _, p)| p.join(BUNDLE).is_dir()).collect();
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out
+}
+
+fn now_s() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn get(url: &str, limit: u64) -> Result<Vec<u8>, String> {
+    let mut response = ureq::get(url)
+        .header("User-Agent", "fpSupGyroflow-updater")
+        .header("Accept", "application/vnd.github+json")
+        .call().map_err(|e| format!("{url}: {e}"))?;
+    response.body_mut().with_config().limit(limit).read_to_vec().map_err(|e| format!("{url}: {e}"))
+}
+
+pub fn fetch_releases() -> Result<Vec<Release>, String> {
+    let body = get(&format!("https://api.github.com/repos/{REPO}/releases?per_page=50"), 4 << 20)?;
+    parse_releases(&String::from_utf8_lossy(&body))
+}
+
+/// A status line for the plugin: checks the network at most once a day unless
+/// `force`, remembering the answer in between.
+pub fn check(force: bool) -> String {
+    let stamp = state_dir().join("last_check");
+    let cached = std::fs::read_to_string(&stamp).ok().and_then(|s| {
+        let (when, latest) = s.trim().split_once(' ')?;
+        Some((when.parse::<u64>().ok()?, latest.parse::<u32>().ok()?))
+    });
+    let latest = match cached {
+        Some((when, latest)) if !force && now_s().saturating_sub(when) < CHECK_EVERY_S => Ok(latest),
+        _ => fetch_releases().map(|r| r.first().map_or(0, |r| r.number)).inspect(|latest| {
+            let _ = std::fs::create_dir_all(state_dir());
+            let _ = std::fs::write(&stamp, format!("{} {latest}", now_s()));
+        }),
+    };
+    match latest {
+        Ok(n) if n > RELEASE => format!("fpSup v{RELEASE}: v{n} is available (Install)"),
+        Ok(_) => format!("fpSup v{RELEASE}: up to date"),
+        Err(e) => format!("fpSup v{RELEASE}: update check failed ({e})"),
+    }
+}
+
+fn sha256_of(path: &Path) -> Result<String, String> {
+    let output = if cfg!(target_os = "windows") {
+        Command::new("powershell").args(["-NoProfile", "-Command", &format!("(Get-FileHash -Algorithm SHA256 '{}').Hash", path.display())]).output()
+    } else if cfg!(target_os = "macos") {
+        Command::new("shasum").args(["-a", "256"]).arg(path).output()
+    } else {
+        Command::new("sha256sum").arg(path).output()
+    }.map_err(|e| format!("sha256: {e}"))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let digest = text.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    if digest.len() == 64 { Ok(digest) } else { Err(format!("sha256: {}", String::from_utf8_lossy(&output.stderr))) }
+}
+
+fn run(cmd: &mut Command) -> Result<(), String> {
+    let out = cmd.output().map_err(|e| format!("{cmd:?}: {e}"))?;
+    if out.status.success() { Ok(()) } else { Err(format!("{cmd:?}: {}", String::from_utf8_lossy(&out.stderr).trim())) }
+}
+
+/// Swap `new_bundle` into the plugin folder; the installed one goes to a new
+/// backup folder labelled `label`. On macOS a refused move is retried with an
+/// administrator prompt; on Windows the move always runs elevated.
+fn swap_in(new_bundle: &Path, label: &str) -> Result<(), String> {
+    swap_in_at(&install_dir(), &backup_dir(), new_bundle, label)
+}
+
+fn swap_in_at(plugins: &Path, backups: &Path, new_bundle: &Path, label: &str) -> Result<(), String> {
+    let installed = plugins.join(BUNDLE);
+    let mut stamp = now_s();
+    while backups.join(format!("{stamp}-{label}")).exists() { stamp += 1; }   // two swaps in one second
+    let backup = backups.join(format!("{stamp}-{label}"));
+    std::fs::create_dir_all(&backup).map_err(|e| format!("{}: {e}", backup.display()))?;
+    let saved = backup.join(BUNDLE);
+    if cfg!(target_os = "windows") {
+        let script = format!(
+            "if (Test-Path '{i}') {{ Move-Item -Force '{i}' '{s}' }}; Move-Item -Force '{n}' '{i}'",
+            i = installed.display(), s = saved.display(), n = new_bundle.display());
+        return run(Command::new("powershell").args(["-NoProfile", "-Command",
+            &format!("Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile','-Command',\"{}\"", script.replace('"', "`\""))]));
+    }
+    // mv, not rename: the temporary folder may sit on another volume.
+    let plain = (|| -> Result<(), String> {
+        if installed.exists() { run(Command::new("mv").arg(&installed).arg(&saved))?; }
+        run(Command::new("mv").arg(new_bundle).arg(&installed))
+    })();
+    match plain {
+        Ok(()) => Ok(()),
+        Err(e) if cfg!(target_os = "macos") => {
+            let q = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+            let shell = format!("{{ [ ! -e {i} ] || mv {i} {s}; }} && mv {n} {i}", i = q(&installed), s = q(&saved), n = q(new_bundle));
+            run(Command::new("osascript").args(["-e",
+                &format!("do shell script \"{}\" with administrator privileges", shell.replace('\\', "\\\\").replace('"', "\\\""))]))
+                .map_err(|e2| format!("{e}; with administrator rights: {e2}"))
+        }
+        Err(e) => Err(format!("{}: {e} (install it by hand from {})", installed.display(), new_bundle.display())),
+    }
+}
+
+/// Install release `number` (any, newer or older), or the newest when `None`.
+/// The running editor keeps the loaded copy; the new one loads on restart.
+pub fn install(number: Option<u32>) -> Result<String, String> {
+    let releases = fetch_releases()?;
+    let release = match number {
+        Some(n) => releases.iter().find(|r| r.number == n).ok_or_else(|| format!("no release fpsup-v{n}"))?,
+        None => releases.first().ok_or("no fpSup release yet")?,
+    };
+    let url_of = |name: &str| release.assets.iter().find(|(a, _)| a == name).map(|(_, u)| u.clone());
+    let zip_name = platform_asset();
+    let zip_url = url_of(zip_name).ok_or_else(|| format!("{} has no {zip_name}", release.tag))?;
+    let sums_url = url_of("SHA256SUMS").ok_or_else(|| format!("{} has no SHA256SUMS", release.tag))?;
+    let want = digest_for(&String::from_utf8_lossy(&get(&sums_url, 1 << 20)?), zip_name)
+        .ok_or_else(|| format!("SHA256SUMS lists no {zip_name}"))?;
+
+    let work = std::env::temp_dir().join(format!("fpsup-update-{}", now_s()));
+    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    let zip = work.join(zip_name);
+    std::fs::write(&zip, get(&zip_url, 512 << 20)?).map_err(|e| e.to_string())?;
+    let got = sha256_of(&zip)?;
+    if got != want {
+        return Err(format!("{zip_name}: SHA-256 {got} is not the release's {want}"));
+    }
+    let unpacked = work.join("unpacked");
+    if cfg!(target_os = "windows") {
+        run(Command::new("powershell").args(["-NoProfile", "-Command",
+            &format!("Expand-Archive -Force '{}' '{}'", zip.display(), unpacked.display())]))?;
+    } else if cfg!(target_os = "macos") {
+        run(Command::new("ditto").args(["-x", "-k"]).arg(&zip).arg(&unpacked))?;
+    } else {
+        run(Command::new("unzip").arg("-q").arg(&zip).arg("-d").arg(&unpacked))?;
+    }
+    let bundle = find_bundle(&unpacked).ok_or_else(|| format!("{zip_name} holds no {BUNDLE}"))?;
+    if cfg!(target_os = "macos") && run(Command::new("codesign").args(["--verify", "--deep"]).arg(&bundle)).is_err() {
+        run(Command::new("codesign").args(["--force", "--deep", "-s", "-"]).arg(&bundle))?;
+    }
+    swap_in(&bundle, &format!("v{RELEASE}"))?;
+    Ok(format!("Installed {} (was v{RELEASE}); restart the editor to load it", release.tag))
+}
+
+fn find_bundle(dir: &Path) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.file_name().is_some_and(|n| n == BUNDLE) && path.is_dir() {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(found) = find_bundle(&path) { return Some(found); }
+        }
+    }
+    None
+}
+
+/// Put the newest backup back in place; what was installed becomes a backup.
+pub fn roll_back() -> Result<String, String> {
+    roll_back_at(&install_dir(), &backup_dir())
+}
+
+fn roll_back_at(plugins: &Path, backup_root: &Path) -> Result<String, String> {
+    let (_, label, folder) = backups_in(backup_root).into_iter().next().ok_or("no backup to roll back to")?;
+    let work = std::env::temp_dir().join(format!("fpsup-rollback-{}", now_s()));
+    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    let staged = work.join(BUNDLE);
+    if cfg!(target_os = "windows") {
+        std::fs::rename(folder.join(BUNDLE), &staged).map_err(|e| format!("{}: {e}", folder.display()))?;
+    } else {
+        run(Command::new("mv").arg(folder.join(BUNDLE)).arg(&staged))?;
+    }
+    let _ = std::fs::remove_dir(&folder);
+    swap_in_at(plugins, backup_root, &staged, &format!("v{RELEASE}"))?;
+    Ok(format!("Rolled back to {label} (was v{RELEASE}); restart the editor to load it"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn releases_are_read_newest_first_and_others_ignored() {
+        let json = r#"[
+            {"tag_name": "fpsup-v2", "draft": false, "assets": [{"name": "SHA256SUMS", "browser_download_url": "https://x/s"}]},
+            {"tag_name": "v2.1.1", "draft": false, "assets": []},
+            {"tag_name": "fpsup-v10", "draft": false, "assets": [{"name": "fpSupGyroflow-OpenFX-macos.zip", "browser_download_url": "https://x/m"}]},
+            {"tag_name": "fpsup-v11", "draft": true, "assets": []}
+        ]"#;
+        let r = parse_releases(json).unwrap();
+        assert_eq!(r.iter().map(|r| r.number).collect::<Vec<_>>(), vec![10, 2]);
+        assert_eq!(r[0].assets[0].0, "fpSupGyroflow-OpenFX-macos.zip");
+        assert_eq!(release_number("fpsup-v3"), Some(3));
+        assert_eq!(release_number("fpsup-vx"), None);
+        assert!(parse_releases("{}").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_keeps_a_backup_and_roll_back_swaps_back_and_forth() {
+        let root = std::env::temp_dir().join(format!("fpsup-update-test-{}", fastrand::u64(..)));
+        let (plugins, backups) = (root.join("Plugins"), root.join("backups"));
+        let bundle = |dir: &Path, mark: &str| {
+            std::fs::create_dir_all(dir.join(BUNDLE).join("Contents")).unwrap();
+            std::fs::write(dir.join(BUNDLE).join("Contents/mark"), mark).unwrap();
+        };
+        let mark = || std::fs::read_to_string(plugins.join(BUNDLE).join("Contents/mark")).unwrap();
+        bundle(&plugins, "old");
+        let incoming = root.join("incoming");
+        bundle(&incoming, "new");
+        swap_in_at(&plugins, &backups, &incoming.join(BUNDLE), "v1").unwrap();
+        assert_eq!(mark(), "new");
+        assert_eq!(backups_in(&backups).len(), 1);
+        roll_back_at(&plugins, &backups).unwrap();
+        assert_eq!(mark(), "old", "rolled back");
+        roll_back_at(&plugins, &backups).unwrap();
+        assert_eq!(mark(), "new", "and the roll back itself can be undone");
+        assert_eq!(backups_in(&backups).len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_digest_is_taken_for_the_named_file_only() {
+        let a = "a".repeat(64);
+        let b = "B".repeat(64);
+        let sums = format!("{a}  fpSupGyroflow-OpenFX-linux.zip\n{b} *./fpSupGyroflow-OpenFX-macos.zip\nshort  x.zip\n");
+        assert_eq!(digest_for(&sums, "fpSupGyroflow-OpenFX-macos.zip"), Some("b".repeat(64)));
+        assert_eq!(digest_for(&sums, "fpSupGyroflow-OpenFX-linux.zip"), Some(a));
+        assert_eq!(digest_for(&sums, "x.zip"), None);
+        assert_eq!(digest_for(&sums, "missing.zip"), None);
+    }
+}

@@ -48,6 +48,8 @@ deploy:
         fi
     fi
 
+    # A fork without the Apple certificate signs ad hoc (no notarization).
+    if [[ -n "$SIGNING_FINGERPRINT" ]]; then SIGN="--options=runtime --timestamp -s $SIGNING_FINGERPRINT"; else SIGN="-s -"; fi
     cd "{{TargetDir}}"
     rm -Rf gyroflow-ofx-macos fpSupGyroflow-OpenFX-macos.dmg
     mkdir -p gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/MacOS
@@ -59,10 +61,10 @@ deploy:
     /usr/libexec/PlistBuddy -c "add CFBundleVersion string $version_short" gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/Info.plist
     /usr/libexec/PlistBuddy -c "add CFBundleShortVersionString string $version" gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/Info.plist
 
-    codesign -vvvv --strict --options=runtime --timestamp --force -s ${SIGNING_FINGERPRINT} gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/MacOS/fpSupGyroflow.dylib
+    codesign -vvvv --strict --force $SIGN gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/MacOS/fpSupGyroflow.dylib
     mv gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/MacOS/fpSupGyroflow.dylib gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/MacOS/fpSupGyroflow.ofx
 
-    codesign -vvvv --deep --strict --options=runtime --timestamp --force -s ${SIGNING_FINGERPRINT} gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle
+    codesign -vvvv --deep --strict --force $SIGN gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle
     codesign -vvvv --deep --verify gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle
 
     pushd gyroflow-ofx-macos
@@ -72,7 +74,7 @@ deploy:
     ln -sf /Library/OFX/Plugins "gyroflow-ofx-macos/"
     hdiutil create "fpSupGyroflow-OpenFX-macos.dmg" -volname "Gyroflow OpenFX plugin" -fs HFS+ -srcfolder "gyroflow-ofx-macos/" -ov -format UDZO -imagekey zlib-level=9
 
-    codesign -vvvv --strict --options=runtime --timestamp --force -s ${SIGNING_FINGERPRINT} "fpSupGyroflow-OpenFX-macos.dmg"
+    codesign -vvvv --strict --force $SIGN "fpSupGyroflow-OpenFX-macos.dmg"
     codesign -vvvv --deep --verify "fpSupGyroflow-OpenFX-macos.dmg"
 
 [linux]

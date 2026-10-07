@@ -8,6 +8,7 @@ use std::sync::{ Arc, atomic::AtomicBool };
 mod cdng;
 mod fsg2;
 mod lensdb;
+pub mod update;
 mod lensfit;
 
 pub use gyroflow_core::{ StabilizationManager, keyframes::*, stabilization::*, filesystem, gpu::* };
@@ -70,6 +71,12 @@ pub enum Params {
     IncludeProjectData,
     StabilizationSpeedRamp,
     InfoGroup, InfoGroupEnd,
+    UpdateGroup, UpdateGroupEnd,
+    UpdateStatus,
+    CheckUpdate,
+    UpdateVersion,
+    InstallUpdate,
+    RollBack,
     LoadedProject,
     LoadedPreset,
     LoadedLens,
@@ -269,7 +276,7 @@ impl GyroflowPluginBase {
         }
     }
 
-    pub fn get_param_definitions() -> [ParameterType; 13] {
+    pub fn get_param_definitions() -> [ParameterType; 14] {
         [
             ParameterType::HiddenString { id: "InstanceId" },
             ParameterType::HiddenString { id: "ProjectPath" },
@@ -325,6 +332,13 @@ impl GyroflowPluginBase {
                 ParameterType::Text { id: "LoadedProject",      label: "Loaded project",      hint: "Loaded project or video file" },
                 ParameterType::Text { id: "LoadedPreset",       label: "Loaded preset",       hint: "Loaded preset" },
                 ParameterType::Text { id: "LoadedLens",         label: "Loaded lens profile", hint: "Loaded lens profile" },
+            ] },
+            ParameterType::Group { id: "UpdateGroup", label: "fpSup plugin", opened: false, parameters: vec![
+                ParameterType::Text    { id: "UpdateStatus",  label: "Update status",      hint: "This plugin's release and the newest on GitHub (checked once a day)" },
+                ParameterType::Button  { id: "CheckUpdate",   label: "Check for update",   hint: "Ask GitHub now" },
+                ParameterType::TextBox { id: "UpdateVersion", label: "Version to install", hint: "Empty: the newest release. A number: that release (fpsup-vN), newer or older" },
+                ParameterType::Button  { id: "InstallUpdate", label: "Install",            hint: "Download, check its SHA-256, keep the installed one as a backup, install. Restart the editor to load it" },
+                ParameterType::Button  { id: "RollBack",      label: "Roll back",          hint: "Put the previous installation back (no network). Restart the editor to load it" },
             ] },
         ]
     }
@@ -547,6 +561,7 @@ impl GyroflowPluginBaseInstance {
     pub fn stab_manager(&mut self, params: &mut dyn GyroflowPluginParams, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, out_size: (usize, usize), open_gyroflow_if_no_data: bool) -> PluginResult<Arc<StabilizationManager>> {
         let mut disable_stretch = params.get_bool(Params::DisableStretch)?;
 
+        Self::show_update_status(params);
         let instance_id = params.get_string(Params::InstanceId)?;
         let path = params.get_string(Params::ProjectPath)?;
         if path.is_empty() {
@@ -972,7 +987,46 @@ impl GyroflowPluginBaseInstance {
         }
     }
 
+    /// The update status line, filled in by background work and shown on the
+    /// next callback that has the parameters.
+    fn update_status() -> &'static std::sync::Mutex<String> {
+        static STATUS: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
+        STATUS.get_or_init(|| {
+            std::thread::spawn(|| { let s = update::check(false); *Self::update_status().lock().unwrap() = s; });
+            std::sync::Mutex::new(format!("fpSup v{}: checking...", update::RELEASE))
+        })
+    }
+
+    fn show_update_status(params: &mut dyn GyroflowPluginParams) {
+        let status = Self::update_status().lock().unwrap().clone();
+        if params.get_string(Params::UpdateStatus).unwrap_or_default() != status {
+            let _ = params.set_string(Params::UpdateStatus, &status);
+        }
+    }
+
+    fn run_update_job<F: FnOnce() -> String + Send + 'static>(params: &mut dyn GyroflowPluginParams, busy: &str, job: F) {
+        *Self::update_status().lock().unwrap() = busy.to_owned();
+        let _ = params.set_string(Params::UpdateStatus, busy);
+        std::thread::spawn(move || { let s = job(); *Self::update_status().lock().unwrap() = s; });
+    }
+
     pub fn param_changed(&mut self, params: &mut dyn GyroflowPluginParams, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>, param: Params, user_edited: bool) -> Result<(), Box<dyn std::error::Error>> {
+        Self::show_update_status(params);
+        if param == Params::CheckUpdate {
+            Self::run_update_job(params, "Checking GitHub...", || update::check(true));
+        }
+        if param == Params::InstallUpdate {
+            let wanted = params.get_string(Params::UpdateVersion).unwrap_or_default();
+            let wanted = wanted.trim().trim_start_matches("fpsup-v").trim_start_matches('v').to_owned();
+            match (wanted.is_empty(), wanted.parse::<u32>()) {
+                (true, _) => Self::run_update_job(params, "Installing the newest release...", || update::install(None).unwrap_or_else(|e| format!("Install failed: {e}"))),
+                (false, Ok(n)) => Self::run_update_job(params, &format!("Installing fpsup-v{n}..."), move || update::install(Some(n)).unwrap_or_else(|e| format!("Install failed: {e}"))),
+                (false, Err(_)) => { params.set_string(Params::UpdateStatus, "Version to install: a release number, e.g. 3")?; }
+            }
+        }
+        if param == Params::RollBack {
+            Self::run_update_job(params, "Rolling back...", || update::roll_back().unwrap_or_else(|e| format!("Roll back failed: {e}")));
+        }
         if param == Params::Browse {
             let new_path = Self::browse(&params.get_string(Params::ProjectPath)?);
             if !new_path.is_empty() {
