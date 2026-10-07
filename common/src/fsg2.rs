@@ -2,9 +2,10 @@
 //!
 //! The camera copies raw sensor counts into each DNG's MakerNote tail and does
 //! no arithmetic; everything that turns counts into Gyroflow Protobuf units and
-//! timestamps happens here. Times are never stored: a sample's time is its
-//! global index (counted from the start of the take) times the sample period,
-//! and events and the frame mark are positions in that same sample stream.
+//! timestamps happens here. A sample's time is its global index (counted from
+//! the start of the take) times the sample period; events and the frame mark
+//! are positions in that same sample stream. Frames are timed from the
+//! sensor's Vd events (see `vd_frame_positions`), not from the frame mark.
 //!
 //! Payload layout, all integers little-endian:
 //!
@@ -26,7 +27,14 @@
 //!  46 u16  n_events
 //!  48      samples           n_samples x i16 x, y, z (raw counts)
 //!          events            n_events x { u16 pos, u8 type, u8 len, value }
+//!                              type 1 level: 3 x i16 raw accelerometer counts
+//!                              type 3 Vd: u32 TickTimer us (diagnostics only)
+//!                              (type 2 focus is reserved; the camera does not write it)
 //!          lens table        only with FLAG_LENS_TABLE, LENS_TABLE_BYTES
+//!
+//! The frame mark always equals n_samples (a block ends at its hook); the
+//! camera sets FLAG_DATA_LOST, FLAG_TRUNCATED, FLAG_FIRST_FRAME and
+//! FLAG_LENS_TABLE, never the others.
 //! ```
 
 use gyroflow_core::telemetry_parser::gyroflow::gyroflow_proto;
