@@ -56,7 +56,10 @@ deploy:
 
     lipo {x86_64,aarch64}-apple-darwin/deploy/libgyroflow_ofx.dylib -create -output gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/MacOS/fpSupGyroflow.dylib
     cp "{{justfile_directory()}}/res/Info.plist" gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/
-    cp "{{justfile_directory()}}/../LICENSE"     gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/
+    # LICENSE in Contents/Resources: in Contents/ itself codesign keeps its signature in extended
+    # attributes, which zip drops, so the unzipped bundle failed codesign --verify --deep.
+    mkdir -p gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/Resources
+    cp "{{justfile_directory()}}/../LICENSE"     gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/Resources/
 
     /usr/libexec/PlistBuddy -c "add CFBundleVersion string $version_short" gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/Info.plist
     /usr/libexec/PlistBuddy -c "add CFBundleShortVersionString string $version" gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle/Contents/Info.plist
