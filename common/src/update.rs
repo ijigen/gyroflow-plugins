@@ -13,7 +13,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// This build. Bump it with each `fpsup-vX.Y.Z` tag.
-pub const RELEASE: &str = "0.1.1";
+pub const RELEASE: &str = "0.1.2";
 
 /// A release number, compared part by part: 0.1.10 is after 0.1.9.
 pub type Version = (u32, u32, u32);
@@ -129,6 +129,13 @@ fn get(url: &str, limit: u64) -> Result<Vec<u8>, String> {
     response.body_mut().with_config().limit(limit).read_to_vec().map_err(|e| format!("{url}: {e}"))
 }
 
+/// A release file, with the system's curl: ureq read GitHub's file server at
+/// ~36 KB/s (480 s for the 17 MB macOS zip, 2026-10-08), freezing the editor.
+fn download(url: &str, to: &Path) -> Result<(), String> {
+    let curl = if cfg!(target_os = "windows") { "curl.exe" } else { "curl" };
+    run(Command::new(curl).args(["-fsSL", "--retry", "2", "--max-time", "300", "-o"]).arg(to).arg(url))
+}
+
 pub fn fetch_releases() -> Result<Vec<Release>, String> {
     let body = get(&format!("https://api.github.com/repos/{REPO}/releases?per_page=50"), 4 << 20)?;
     parse_releases(&String::from_utf8_lossy(&body))
@@ -142,8 +149,34 @@ fn status_line(latest: Result<Option<Version>, String>) -> String {
     }
 }
 
+/// Install in the background: the download can take a minute and the editor
+/// must not wait for it. The outcome goes to a system notification and is kept
+/// for the status line (shown when an instance is next created).
+pub fn install_in_background(number: Option<Version>) {
+    std::thread::spawn(move || {
+        let result = install(number).unwrap_or_else(|e| format!("Install failed: {e}"));
+        let _ = std::fs::create_dir_all(state_dir());
+        let _ = std::fs::write(state_dir().join("last_install"), &result);
+        notify(&result);
+    });
+}
+
+/// A system notification (macOS); elsewhere the status line has it.
+fn notify(text: &str) {
+    if cfg!(target_os = "macos") {
+        let t = text.replace('\\', "\\\\").replace('"', "\\\"");
+        let _ = Command::new("osascript").args(["-e", &format!("display notification \"{t}\" with title \"Gyroflow (fpSup)\"")]).status();
+    }
+}
+
 /// The last check's answer, without the network.
 pub fn cached_status() -> String {
+    if let Ok(last) = std::fs::read_to_string(state_dir().join("last_install")) {
+        let _ = std::fs::remove_file(state_dir().join("last_install"));
+        if !last.trim().is_empty() {
+            return last;
+        }
+    }
     let latest = std::fs::read_to_string(state_dir().join("last_check")).ok()
         .and_then(|s| s.trim().split_once(' ').map(|(_, n)| parse_version(n)));
     match latest {
@@ -239,13 +272,14 @@ pub fn install(number: Option<Version>) -> Result<String, String> {
     let zip_name = platform_asset();
     let zip_url = url_of(zip_name).ok_or_else(|| format!("{} has no {zip_name}", release.tag))?;
     let sums_url = url_of("SHA256SUMS").ok_or_else(|| format!("{} has no SHA256SUMS", release.tag))?;
-    let want = digest_for(&String::from_utf8_lossy(&get(&sums_url, 1 << 20)?), zip_name)
-        .ok_or_else(|| format!("SHA256SUMS lists no {zip_name}"))?;
-
     let work = std::env::temp_dir().join(format!("fpsup-update-{}", now_s()));
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    let sums = work.join("SHA256SUMS");
+    download(&sums_url, &sums)?;
+    let want = digest_for(&std::fs::read_to_string(&sums).map_err(|e| e.to_string())?, zip_name)
+        .ok_or_else(|| format!("SHA256SUMS lists no {zip_name}"))?;
     let zip = work.join(zip_name);
-    std::fs::write(&zip, get(&zip_url, 512 << 20)?).map_err(|e| e.to_string())?;
+    download(&zip_url, &zip)?;
     let got = sha256_of(&zip)?;
     if got != want {
         return Err(format!("{zip_name}: SHA-256 {got} is not the release's {want}"));
@@ -348,6 +382,21 @@ mod tests {
         assert_eq!(mark(), "new", "and the roll back itself can be undone");
         assert_eq!(backups_in(&backups).len(), 1);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[ignore]
+    fn the_release_zip_downloads_fast() {
+        // network: the newest release's zip for this platform, in well under a minute
+        let r = fetch_releases().unwrap();
+        let url = r[0].assets.iter().find(|(n, _)| n == platform_asset()).unwrap().1.clone();
+        let to = std::env::temp_dir().join(format!("fpsup-dl-test-{}", now_s()));
+        let t = std::time::Instant::now();
+        download(&url, &to).unwrap();
+        let n = std::fs::metadata(&to).unwrap().len();
+        println!("{n} bytes in {:?}", t.elapsed());
+        assert!(n > 1 << 20 && t.elapsed().as_secs() < 60);
+        let _ = std::fs::remove_file(&to);
     }
 
     #[test]

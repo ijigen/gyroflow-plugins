@@ -1014,8 +1014,8 @@ impl GyroflowPluginBaseInstance {
             let wanted = params.get_string(Params::UpdateVersion).unwrap_or_default();
             let wanted = wanted.trim().trim_start_matches("fpsup-v").trim_start_matches('v').to_owned();
             let status = match (wanted.is_empty(), update::parse_version(&wanted)) {
-                (true, _) => update::install(None).unwrap_or_else(|e| format!("Install failed: {e}")),
-                (false, Some(n)) => update::install(Some(n)).unwrap_or_else(|e| format!("Install failed: {e}")),
+                (true, _) => { update::install_in_background(None); "Downloading the newest release... a notification says when it is done".to_owned() }
+                (false, Some(n)) => { update::install_in_background(Some(n)); format!("Downloading fpsup-v{}... a notification says when it is done", update::show(n)) }
                 (false, None) => "Version to install: a release number, e.g. 0.1.0".to_owned(),
             };
             params.set_string(Params::UpdateStatus, &status)?;
