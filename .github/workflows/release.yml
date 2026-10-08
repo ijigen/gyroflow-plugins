@@ -109,6 +109,12 @@ jobs:
     permissions:
       contents: write       # a fork's token is read-only by default: creating the release needs this
     steps:
+      - uses: actions/checkout@v4
+        with:
+          path: release-source
+          sparse-checkout: RELEASE_NOTES.md
+          sparse-checkout-cone-mode: false
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
 
@@ -123,5 +129,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-         body_path: RELEASE_NOTES.md
-         files: ./**/*
+         body_path: release-source/RELEASE_NOTES.md
+         files: |
+           ./**/fpSupGyroflow-OpenFX-*
+           ./SHA256SUMS
