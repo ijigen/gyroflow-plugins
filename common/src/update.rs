@@ -13,7 +13,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// This build. Bump it with each `fpsup-vX.Y.Z` tag.
-pub const RELEASE: &str = "0.1.3";
+pub const RELEASE: &str = "0.1.4";
 
 /// A release number, compared part by part: 0.1.10 is after 0.1.9.
 pub type Version = (u32, u32, u32);
@@ -152,13 +152,21 @@ fn status_line(latest: Result<Option<Version>, String>) -> String {
 /// Install in the background: the download can take a minute and the editor
 /// must not wait for it. The outcome goes to a system notification and is kept
 /// for the status line (shown when an instance is next created).
-pub fn install_in_background(number: Option<Version>) {
+/// false when an install is already running (a second press is ignored).
+pub fn install_in_background(number: Option<Version>) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    if BUSY.swap(true, Ordering::SeqCst) {
+        return false;
+    }
     std::thread::spawn(move || {
         let result = install(number).unwrap_or_else(|e| format!("Install failed: {e}"));
         let _ = std::fs::create_dir_all(state_dir());
         let _ = std::fs::write(state_dir().join("last_install"), &result);
         notify(&result);
+        BUSY.store(false, Ordering::SeqCst);
     });
+    true
 }
 
 /// A system notification (macOS); elsewhere the status line has it.

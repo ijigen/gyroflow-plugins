@@ -1013,10 +1013,14 @@ impl GyroflowPluginBaseInstance {
         if param == Params::InstallUpdate && user_edited {
             let wanted = params.get_string(Params::UpdateVersion).unwrap_or_default();
             let wanted = wanted.trim().trim_start_matches("fpsup-v").trim_start_matches('v').to_owned();
-            let status = match (wanted.is_empty(), update::parse_version(&wanted)) {
-                (true, _) => { update::install_in_background(None); "Downloading the newest release... a notification says when it is done".to_owned() }
-                (false, Some(n)) => { update::install_in_background(Some(n)); format!("Downloading fpsup-v{}... a notification says when it is done", update::show(n)) }
-                (false, None) => "Version to install: a release number, e.g. 0.1.0".to_owned(),
+            let target = if wanted.is_empty() { Some(None) } else { update::parse_version(&wanted).map(Some) };
+            let status = match target {
+                None => "Version to install: a release number, e.g. 0.1.0".to_owned(),
+                Some(version) if update::install_in_background(version) => match version {
+                    None => "Downloading the newest release in the background... restart Resolve when it is done".to_owned(),
+                    Some(n) => format!("Downloading fpsup-v{} in the background... restart Resolve when it is done", update::show(n)),
+                },
+                Some(_) => "An install is already running: wait for it, then restart Resolve".to_owned(),
             };
             params.set_string(Params::UpdateStatus, &status)?;
         }
