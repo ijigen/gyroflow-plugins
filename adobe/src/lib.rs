@@ -399,7 +399,7 @@ impl AdobePluginGlobal for Plugin {
 impl CrossThreadInstance {
     fn user_changed_param(&mut self, plugin: &mut PluginState, param: Params) -> Result<(), ae::Error> {
         match param {
-            Params::Fov | Params::Smoothness | Params::ZoomLimit | Params::LensCorrectionStrength |
+            Params::Fov | Params::Smoothness | Params::ZoomLimit | Params::ZoomMethod | Params::LensCorrectionStrength |
             Params::HorizonLockAmount | Params::HorizonLockRoll |
             Params::AdditionalPitch | Params::AdditionalYaw | Params::Rotation | Params::InputRotation | Params::VideoSpeed |
             Params::UseGyroflowsKeyframes | Params::RecalculateKeyframes |

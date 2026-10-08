@@ -44,6 +44,7 @@ pub enum Params {
     Fov,
     Smoothness,
     ZoomLimit,
+    ZoomMethod,
     LensCorrectionStrength,
     HorizonLockAmount,
     HorizonLockRoll,
@@ -286,6 +287,7 @@ impl GyroflowPluginBase {
             ParameterType::HiddenString { id: "EmbeddedPreset" },
             ParameterType::Group { id: "ProjectGroup", label: "Gyroflow project", opened: true, parameters: vec![
                 ParameterType::Text    { id: "Status",            label: "Status",                   hint: "Status" },
+                ParameterType::Text    { id: "UpdateStatus",      label: "fpSup plugin",             hint: "This plugin's release and the newest on GitHub (checked once a day). Install, roll back: the fpSup plugin group at the bottom" },
                 ParameterType::Button  { id: "LoadCurrent",       label: "Load for current file",    hint: "Try to load project file for current video file, or try to stabilize that video file directly" },
                 ParameterType::Button  { id: "Browse",            label: "Browse",                   hint: "Browse for a video, a CinemaDNG frame, or a Gyroflow project file" },
                 ParameterType::Button  { id: "LoadLens",          label: "Load preset/lens profile", hint: "Browse for the lens profile or a preset" },
@@ -301,6 +303,7 @@ impl GyroflowPluginBase {
             ParameterType::Group { id: "AdjustGroup", label: "Adjust parameters", opened: true, parameters: vec![
                 ParameterType::Slider   { id: "Smoothness",             label: "Smoothness",           hint: "Smoothness",                   min: 1.0,    max: 300.0, default: 50.0 },
                 ParameterType::Slider   { id: "ZoomLimit",              label: "Zoom limit",           hint: "Zoom limit",                   min: 51.0,   max: 300.0, default: 130.0 },
+                ParameterType::Select   { id: "ZoomMethod",             label: "Zooming",              hint: "Dynamic: the zoom follows the camera movement. Static: one zoom for the whole clip. Off: no zoom, the borders show.", options: vec!["Dynamic", "Static", "Off"], default: "Dynamic" },
                 ParameterType::Slider   { id: "LensCorrectionStrength", label: "Lens correction",      hint: "Lens correction",              min: 0.0,    max: 100.0, default: 100.0 },
                 ParameterType::Slider   { id: "HorizonLockAmount",      label: "Horizon lock",         hint: "Horizon lock amount",          min: 0.0,    max: 100.0, default: 0.0 },
                 ParameterType::Slider   { id: "HorizonLockRoll",        label: "Horizon roll",         hint: "Horizon lock roll adjustment", min: -100.0, max: 100.0, default: 0.0 },
@@ -338,8 +341,7 @@ impl GyroflowPluginBase {
                 ParameterType::Text { id: "LoadedLens",         label: "Loaded lens profile", hint: "Loaded lens profile" },
             ] },
             ParameterType::Group { id: "UpdateGroup", label: "fpSup plugin", opened: false, parameters: vec![
-                ParameterType::Text    { id: "UpdateStatus",  label: "Update status",      hint: "This plugin's release and the newest on GitHub (checked once a day)" },
-                ParameterType::Button  { id: "CheckUpdate",   label: "Check for update",   hint: "Ask GitHub now" },
+                ParameterType::Button  { id: "CheckUpdate",   label: "Check for update",   hint: "Ask GitHub now; while an install runs, show its progress" },
                 ParameterType::TextBox { id: "UpdateVersion", label: "Version to install", hint: "Empty: the newest release. A version (e.g. 0.1.0): that release, newer or older" },
                 ParameterType::Button  { id: "InstallUpdate", label: "Install",            hint: "Download, check its SHA-256, keep the installed one as a backup, install. Restart the editor to load it" },
                 ParameterType::Button  { id: "RollBack",      label: "Roll back",          hint: "Put the previous installation back (no network). Restart the editor to load it" },
@@ -465,11 +467,27 @@ impl Default for GyroflowPluginBaseInstance {
     }
 }
 
+/// The Zooming menu (0 Dynamic, 1 Static, 2 Off) as gyroflow-core's
+/// adaptive_zoom_window: > 0 is a dynamic window in seconds, < -0.9 static, 0 off.
+const DYNAMIC_ZOOM_WINDOW_S: f64 = 4.0;
+
+fn zoom_method_of(window: f64) -> i32 {
+    if window < -0.9 { 1 } else if window > 0.0001 { 0 } else { 2 }
+}
+
+/// Keeps a project's own dynamic window; only a change of method sets a new one.
+fn set_zoom_method(stab: &StabilizationManager, method: i32) {
+    let window = stab.params.read().adaptive_zoom_window;
+    if zoom_method_of(window) == method { return; }
+    stab.set_adaptive_zoom(match method { 1 => -1.0, 2 => 0.0, _ => DYNAMIC_ZOOM_WINDOW_S });
+}
+
 impl GyroflowPluginBaseInstance {
     pub fn update_loaded_state(&mut self, params: &mut dyn GyroflowPluginParams, loaded: bool) {
         let _ = params.set_enabled(Params::Fov, loaded);
         let _ = params.set_enabled(Params::Smoothness, loaded);
         let _ = params.set_enabled(Params::ZoomLimit, loaded);
+        let _ = params.set_enabled(Params::ZoomMethod, loaded);
         let _ = params.set_enabled(Params::LensCorrectionStrength, loaded);
         let _ = params.set_enabled(Params::HorizonLockAmount, loaded);
         let _ = params.set_enabled(Params::HorizonLockRoll, loaded);
@@ -796,6 +814,7 @@ impl GyroflowPluginBaseInstance {
                     params.set_f64(Params::Fov,                    gf_params.fov)?;
                     params.set_f64(Params::Smoothness,             smoothness * 100.0)?;
                     params.set_f64(Params::ZoomLimit,              gf_params.max_zoom.unwrap_or(0.0))?;
+                    params.set_i32(Params::ZoomMethod,             zoom_method_of(gf_params.adaptive_zoom_window))?;
                     params.set_f64(Params::LensCorrectionStrength, (gf_params.lens_correction_amount * 100.0).min(100.0))?;
                     params.set_f64(Params::HorizonLockAmount,      if smooth.horizon_lock.lock_enabled { smooth.horizon_lock.horizonlockpercent } else { 0.0 })?;
                     params.set_f64(Params::HorizonLockRoll,        if smooth.horizon_lock.lock_enabled { smooth.horizon_lock.horizonroll } else { 0.0 })?;
@@ -911,6 +930,9 @@ impl GyroflowPluginBaseInstance {
             }
 
             stab.set_fov_overview(params.get_bool(Params::ToggleOverview)?);
+            if let Ok(zm) = params.get_i32(Params::ZoomMethod) {
+                set_zoom_method(&stab, zm);
+            }
 
             {
                 let mut params = stab.params.write();
@@ -1008,7 +1030,7 @@ impl GyroflowPluginBaseInstance {
             return Ok(());                    // our own write coming back
         }
         if param == Params::CheckUpdate && user_edited {
-            params.set_string(Params::UpdateStatus, &update::check(true))?;
+            params.set_string(Params::UpdateStatus, &update::status_on_check())?;
         }
         if param == Params::InstallUpdate && user_edited {
             let wanted = params.get_string(Params::UpdateVersion).unwrap_or_default();
@@ -1017,10 +1039,10 @@ impl GyroflowPluginBaseInstance {
             let status = match target {
                 None => "Version to install: a release number, e.g. 0.1.0".to_owned(),
                 Some(version) if update::install_in_background(version) => match version {
-                    None => "Downloading the newest release in the background... restart Resolve when it is done".to_owned(),
-                    Some(n) => format!("Downloading fpsup-v{} in the background... restart Resolve when it is done", update::show(n)),
+                    None => "Downloading the newest release in the background. Check for update shows the progress; restart Resolve when it is done".to_owned(),
+                    Some(n) => format!("Downloading fpsup-v{} in the background. Check for update shows the progress; restart Resolve when it is done", update::show(n)),
                 },
-                Some(_) => "An install is already running: wait for it, then restart Resolve".to_owned(),
+                Some(_) => update::status_on_check(),
             };
             params.set_string(Params::UpdateStatus, &status)?;
         }
@@ -1120,7 +1142,7 @@ impl GyroflowPluginBaseInstance {
                 }
             }
             match param {
-                Params::Fov | Params::Smoothness | Params::ZoomLimit | Params::LensCorrectionStrength |
+                Params::Fov | Params::Smoothness | Params::ZoomLimit | Params::ZoomMethod | Params::LensCorrectionStrength |
                 Params::HorizonLockAmount | Params::HorizonLockRoll |
                 //Params::PositionX | Params::PositionY |
                 Params::AdditionalPitch | Params::AdditionalYaw |
@@ -1149,6 +1171,12 @@ impl GyroflowPluginBaseInstance {
                             Params::Smoothness | Params::ZoomLimit | Params::HorizonLockAmount | Params::HorizonLockRoll |
                             Params::AdditionalPitch | Params::AdditionalYaw | Params::RecalculateKeyframes => {
                                 v.invalidate_blocking_smoothing();
+                                v.invalidate_blocking_zooming();
+                            },
+                            Params::ZoomMethod => {
+                                if let Ok(zm) = params.get_i32(Params::ZoomMethod) {
+                                    set_zoom_method(v, zm);
+                                }
                                 v.invalidate_blocking_zooming();
                             },
                             //Params::PositionX | Params::PositionY |
@@ -1380,4 +1408,31 @@ macro_rules! define_params {
             }
         }
     };
+}
+
+#[cfg(test)]
+mod zoom_method_tests {
+    use super::*;
+
+    #[test]
+    fn zooming_menu_sets_the_core_window() {
+        let stab = StabilizationManager::default();
+        assert_eq!(zoom_method_of(stab.params.read().adaptive_zoom_window), 0, "core default is dynamic");
+        set_zoom_method(&stab, 1);
+        assert!(stab.params.read().adaptive_zoom_window < -0.9);
+        set_zoom_method(&stab, 2);
+        assert_eq!(stab.params.read().adaptive_zoom_window, 0.0);
+        set_zoom_method(&stab, 0);
+        assert_eq!(stab.params.read().adaptive_zoom_window, DYNAMIC_ZOOM_WINDOW_S);
+    }
+
+    #[test]
+    fn dynamic_keeps_a_projects_own_window() {
+        let stab = StabilizationManager::default();
+        stab.set_adaptive_zoom(2.5);
+        set_zoom_method(&stab, 0);
+        assert_eq!(stab.params.read().adaptive_zoom_window, 2.5);
+        assert_eq!(zoom_method_of(-1.0), 1);
+        assert_eq!(zoom_method_of(0.0), 2);
+    }
 }

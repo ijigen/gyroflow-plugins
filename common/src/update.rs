@@ -10,10 +10,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// This build. Bump it with each `fpsup-vX.Y.Z` tag.
-pub const RELEASE: &str = "0.1.6";
+pub const RELEASE: &str = "0.1.7";
 
 /// A release number, compared part by part: 0.1.10 is after 0.1.9.
 pub type Version = (u32, u32, u32);
@@ -43,8 +45,8 @@ const CHECK_EVERY_S: u64 = 24 * 3600;
 pub struct Release {
     pub number: Version,
     pub tag: String,
-    /// (asset name, download url)
-    pub assets: Vec<(String, String)>,
+    /// (asset name, download url, size in bytes; 0 when not listed)
+    pub assets: Vec<(String, String, u64)>,
 }
 
 /// `fpsup-v0.1.2` -> (0, 1, 2); other tags (the upstream plugin's) -> None.
@@ -62,7 +64,7 @@ pub fn parse_releases(json: &str) -> Result<Vec<Release>, String> {
         let tag = r["tag_name"].as_str()?.to_owned();
         let number = release_number(&tag)?;
         let assets = r["assets"].as_array()?.iter().filter_map(|a| {
-            Some((a["name"].as_str()?.to_owned(), a["browser_download_url"].as_str()?.to_owned()))
+            Some((a["name"].as_str()?.to_owned(), a["browser_download_url"].as_str()?.to_owned(), a["size"].as_u64().unwrap_or(0)))
         }).collect();
         Some(Release { number, tag, assets })
     }).collect();
@@ -143,7 +145,7 @@ pub fn fetch_releases() -> Result<Vec<Release>, String> {
 
 fn status_line(latest: Result<Option<Version>, String>) -> String {
     match latest {
-        Ok(Some(n)) if n > this_build() => format!("fpSup v{RELEASE}: v{} is available (Install)", show(n)),
+        Ok(Some(n)) if n > this_build() => format!("fpSup v{RELEASE}: v{} is available, Install is in the fpSup plugin group at the bottom", show(n)),
         Ok(_) => format!("fpSup v{RELEASE}: up to date"),
         Err(e) => format!("fpSup v{RELEASE}: update check failed ({e})"),
     }
@@ -154,8 +156,6 @@ fn status_line(latest: Result<Option<Version>, String>) -> String {
 /// for the status line (shown when an instance is next created).
 /// false when an install is already running (a second press is ignored).
 pub fn install_in_background(number: Option<Version>) -> bool {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static BUSY: AtomicBool = AtomicBool::new(false);
     if BUSY.swap(true, Ordering::SeqCst) {
         return false;
     }
@@ -163,10 +163,56 @@ pub fn install_in_background(number: Option<Version>) -> bool {
         let result = install(number).unwrap_or_else(|e| format!("Install failed: {e}"));
         let _ = std::fs::create_dir_all(state_dir());
         let _ = std::fs::write(state_dir().join("last_install"), &result);
+        *STAGE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         notify(&result);
         BUSY.store(false, Ordering::SeqCst);
     });
     true
+}
+
+static BUSY: AtomicBool = AtomicBool::new(false);
+
+/// What a running install is doing. A parameter is written only from a button
+/// (see `show_update_status`), so the status shows it when Check is pressed.
+enum Stage {
+    Fetching,
+    Downloading { tag: String, file: PathBuf, total: u64 },
+    Finishing(&'static str),
+}
+
+static STAGE: Mutex<Option<Stage>> = Mutex::new(None);
+
+fn set_stage(stage: Stage) {
+    *STAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some(stage);
+}
+
+/// "Downloading fpsup-v0.1.8: 45% (7.6 / 17.0 MB)"; without a listed size, only the MB so far.
+fn download_line(tag: &str, got: u64, total: u64) -> String {
+    let mb = |b: u64| b as f64 / 1e6;
+    if total > 0 {
+        let pct = (got.min(total) * 100 / total) as u32;
+        format!("Downloading {tag}: {pct}% ({:.1} / {:.1} MB)", mb(got.min(total)), mb(total))
+    } else {
+        format!("Downloading {tag}: {:.1} MB", mb(got))
+    }
+}
+
+/// The status line for Check: a running install's progress, else the last
+/// install's outcome (kept until the editor restarts), else a check of GitHub.
+pub fn status_on_check() -> String {
+    if BUSY.load(Ordering::SeqCst) {
+        let stage = STAGE.lock().unwrap_or_else(|e| e.into_inner());
+        return match stage.as_ref() {
+            Some(Stage::Downloading { tag, file, total }) =>
+                download_line(tag, std::fs::metadata(file).map_or(0, |m| m.len()), *total),
+            Some(Stage::Finishing(what)) => format!("Install: {what}..."),
+            Some(Stage::Fetching) | None => "Install: asking GitHub for the release...".to_owned(),
+        };
+    }
+    match std::fs::read_to_string(state_dir().join("last_install")) {
+        Ok(last) if !last.trim().is_empty() => last,
+        _ => check(true),
+    }
 }
 
 /// A system notification (macOS); elsewhere the status line has it.
@@ -271,15 +317,16 @@ fn swap_in_at(plugins: &Path, backups: &Path, new_bundle: &Path, label: &str) ->
 /// Install release `number` (any, newer or older), or the newest when `None`.
 /// The running editor keeps the loaded copy; the new one loads on restart.
 pub fn install(number: Option<Version>) -> Result<String, String> {
+    set_stage(Stage::Fetching);
     let releases = fetch_releases()?;
     let release = match number {
         Some(n) => releases.iter().find(|r| r.number == n).ok_or_else(|| format!("no release fpsup-v{}", show(n)))?,
         None => releases.first().ok_or("no fpSup release yet")?,
     };
-    let url_of = |name: &str| release.assets.iter().find(|(a, _)| a == name).map(|(_, u)| u.clone());
+    let asset = |name: &str| release.assets.iter().find(|(a, _, _)| a == name).map(|(_, u, n)| (u.clone(), *n));
     let zip_name = platform_asset();
-    let zip_url = url_of(zip_name).ok_or_else(|| format!("{} has no {zip_name}", release.tag))?;
-    let sums_url = url_of("SHA256SUMS").ok_or_else(|| format!("{} has no SHA256SUMS", release.tag))?;
+    let (zip_url, zip_size) = asset(zip_name).ok_or_else(|| format!("{} has no {zip_name}", release.tag))?;
+    let (sums_url, _) = asset("SHA256SUMS").ok_or_else(|| format!("{} has no SHA256SUMS", release.tag))?;
     let work = std::env::temp_dir().join(format!("fpsup-update-{}", now_s()));
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let sums = work.join("SHA256SUMS");
@@ -287,11 +334,14 @@ pub fn install(number: Option<Version>) -> Result<String, String> {
     let want = digest_for(&std::fs::read_to_string(&sums).map_err(|e| e.to_string())?, zip_name)
         .ok_or_else(|| format!("SHA256SUMS lists no {zip_name}"))?;
     let zip = work.join(zip_name);
+    set_stage(Stage::Downloading { tag: release.tag.clone(), file: zip.clone(), total: zip_size });
     download(&zip_url, &zip)?;
+    set_stage(Stage::Finishing("checking the SHA-256"));
     let got = sha256_of(&zip)?;
     if got != want {
         return Err(format!("{zip_name}: SHA-256 {got} is not the release's {want}"));
     }
+    set_stage(Stage::Finishing("unpacking"));
     let unpacked = work.join("unpacked");
     if cfg!(target_os = "windows") {
         run(Command::new("powershell").args(["-NoProfile", "-Command",
@@ -305,6 +355,7 @@ pub fn install(number: Option<Version>) -> Result<String, String> {
     if cfg!(target_os = "macos") && run(Command::new("codesign").args(["--verify", "--deep"]).arg(&bundle)).is_err() {
         run(Command::new("codesign").args(["--force", "--deep", "-s", "-"]).arg(&bundle))?;
     }
+    set_stage(Stage::Finishing("installing"));
     swap_in(&bundle, &format!("v{RELEASE}"))?;
     Ok(format!("Installed {} (was v{RELEASE}); restart the editor to load it", release.tag))
 }
@@ -351,12 +402,14 @@ mod tests {
         let json = r#"[
             {"tag_name": "fpsup-v0.1.2", "draft": false, "assets": [{"name": "SHA256SUMS", "browser_download_url": "https://x/s"}]},
             {"tag_name": "v2.1.1", "draft": false, "assets": []},
-            {"tag_name": "fpsup-v0.1.10", "draft": false, "assets": [{"name": "fpSupGyroflow-OpenFX-macos.zip", "browser_download_url": "https://x/m"}]},
+            {"tag_name": "fpsup-v0.1.10", "draft": false, "assets": [{"name": "fpSupGyroflow-OpenFX-macos.zip", "browser_download_url": "https://x/m", "size": 17000000}]},
             {"tag_name": "fpsup-v0.1.11", "draft": true, "assets": []}
         ]"#;
         let r = parse_releases(json).unwrap();
         assert_eq!(r.iter().map(|r| r.number).collect::<Vec<_>>(), vec![(0, 1, 10), (0, 1, 2)]);
         assert_eq!(r[0].assets[0].0, "fpSupGyroflow-OpenFX-macos.zip");
+        assert_eq!(r[0].assets[0].2, 17_000_000);
+        assert_eq!(r[1].assets[0].2, 0, "no size listed");
         assert_eq!(release_number("fpsup-v0.2.0"), Some((0, 2, 0)));
         assert_eq!(release_number("fpsup-vx"), None);
         assert_eq!(release_number("v2.1.1"), None, "the upstream plugin's tags are not ours");
@@ -397,7 +450,7 @@ mod tests {
     fn the_release_zip_downloads_fast() {
         // network: the newest release's zip for this platform, in well under a minute
         let r = fetch_releases().unwrap();
-        let url = r[0].assets.iter().find(|(n, _)| n == platform_asset()).unwrap().1.clone();
+        let url = r[0].assets.iter().find(|(n, _, _)| n == platform_asset()).unwrap().1.clone();
         let to = std::env::temp_dir().join(format!("fpsup-dl-test-{}", now_s()));
         let t = std::time::Instant::now();
         download(&url, &to).unwrap();
@@ -416,5 +469,13 @@ mod tests {
         assert_eq!(digest_for(&sums, "fpSupGyroflow-OpenFX-linux.zip"), Some(a));
         assert_eq!(digest_for(&sums, "x.zip"), None);
         assert_eq!(digest_for(&sums, "missing.zip"), None);
+    }
+
+    #[test]
+    fn download_progress_line() {
+        assert_eq!(download_line("fpsup-v0.1.8", 7_650_000, 17_000_000), "Downloading fpsup-v0.1.8: 45% (7.7 / 17.0 MB)");
+        assert_eq!(download_line("fpsup-v0.1.8", 0, 17_000_000), "Downloading fpsup-v0.1.8: 0% (0.0 / 17.0 MB)");
+        assert_eq!(download_line("fpsup-v0.1.8", 18_000_000, 17_000_000), "Downloading fpsup-v0.1.8: 100% (17.0 / 17.0 MB)");
+        assert_eq!(download_line("fpsup-v0.1.8", 2_500_000, 0), "Downloading fpsup-v0.1.8: 2.5 MB");
     }
 }
