@@ -46,6 +46,28 @@ You can also apply the plugin on the Edit or Color page - it should work faster 
 In DaVinci Resolve, go to the `Gyroflow` plugin settings. Select the `.gyroflow` file in the `Project file` entry.
 If your video file is from GoPro 8+, DJI or Insta360, you can also select video file directly. If it's from Sony or it's BRAW - you can also select the video file directly, but you need to load lens profile or preset after that.
 
+### Open fpSup CinemaDNG in the stock Gyroflow app
+
+Starting with fpSup v0.1.8, after loading a Gyro2 CinemaDNG take in the plugin,
+click `Open in Gyroflow`.
+The plugin writes a `.gyroflow` project with the already parsed motion
+samples, frame timing and lens data, then opens it in Gyroflow. The stock app
+does not need to understand the private DNG telemetry carrier. This handoff is
+compatible with Gyroflow 1.6.3 and retains the original sample values.
+
+The plugin switches its `Data source` to that project, stored persistently in
+Gyroflow's application data folder under `fpsup-handoffs`. In the app, use the
+arrow beside `Export` and select `Save project file`, then click `Reload project`
+in the plugin. The saved project
+supplies all stabilization data; the plugin does not re-read telemetry from the
+DNG. Reload also refreshes an embedded copy if `Embed .gyroflow data in plugin`
+is enabled. If you save to another project path, use `Browse` to select it in the
+plugin. To return to original camera data, browse to a DNG frame again.
+
+The video still refers to the original DNG sequence. Gyroflow's DNG decoder can
+include sensor borders outside the active crop, so a lens dimensions warning
+may need attention before using its video stabilization output.
+
 ## For more detailed instructions, see the [docs](https://docs.gyroflow.xyz/app/video-editor-plugins/general-plugin-workflow)
 
 

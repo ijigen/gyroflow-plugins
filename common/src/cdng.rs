@@ -192,7 +192,7 @@ fn read_messages(paths: &[PathBuf], options: &fsg2::Options) -> Result<Vec<gyrof
     }
 }
 
-fn sequence_paths(first: &Path) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn sequence_paths(first: &Path) -> Result<Vec<PathBuf>, String> {
     if !first.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("dng")) {
         return Err(format!("{}: expected a DNG file", first.display()));
     }

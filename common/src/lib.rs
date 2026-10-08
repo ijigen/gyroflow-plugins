@@ -9,6 +9,7 @@ mod cdng;
 mod fsg2;
 pub mod update;
 mod lensfit;
+mod handoff;
 
 pub use gyroflow_core::{ StabilizationManager, keyframes::*, stabilization::*, filesystem, gpu::* };
 pub use gyroflow_core;
@@ -287,6 +288,7 @@ impl GyroflowPluginBase {
             ParameterType::HiddenString { id: "EmbeddedPreset" },
             ParameterType::Group { id: "ProjectGroup", label: "Gyroflow project", opened: true, parameters: vec![
                 ParameterType::Text    { id: "Status",            label: "Status",                   hint: "Status" },
+                ParameterType::Text    { id: "LoadedProject",     label: "Data source",              hint: "The file supplying stabilization data. A .gyroflow project supplies saved edits; a DNG supplies original camera data. After saving edits in Gyroflow, click Reload project." },
                 ParameterType::Text    { id: "UpdateStatus",      label: "fpSup plugin",             hint: "This plugin's release and the newest on GitHub (checked once a day). Install, roll back: the fpSup plugin group at the bottom" },
                 ParameterType::Button  { id: "LoadCurrent",       label: "Load for current file",    hint: "Try to load project file for current video file, or try to stabilize that video file directly" },
                 ParameterType::Button  { id: "Browse",            label: "Browse",                   hint: "Browse for a video, a CinemaDNG frame, or a Gyroflow project file" },
@@ -336,7 +338,6 @@ impl GyroflowPluginBase {
             ParameterType::Checkbox { id: "DontDrawOutside",    label: "Don't draw outside source clip", hint: "When clip and timeline aspect ratio don't match, draw the final image inside the source clip, instead of drawing outside it.", default: false },
             ParameterType::Checkbox { id: "IncludeProjectData", label: "Embed .gyroflow data in plugin", hint: "If you intend to share the project to someone else, the plugin can embed the Gyroflow project data including gyro data inside the video editor project. This way you don't have to share .gyroflow project files. Enabling this option will make the project bigger.", default: false },
             ParameterType::Group { id: "InfoGroup", label: "Info", opened: true, parameters: vec![
-                ParameterType::Text { id: "LoadedProject",      label: "Loaded project",      hint: "Loaded project or video file" },
                 ParameterType::Text { id: "LoadedPreset",       label: "Loaded preset",       hint: "Loaded preset" },
                 ParameterType::Text { id: "LoadedLens",         label: "Loaded lens profile", hint: "Loaded lens profile" },
             ] },
@@ -982,6 +983,15 @@ impl GyroflowPluginBaseInstance {
         }
     }
 
+    fn reload_stab(&mut self, manager_cache: &Mutex<LruCache<String, Arc<StabilizationManager>>>) {
+        let keys = self.managers.iter().map(|x| x.0.clone()).collect::<Vec<_>>();
+        self.managers.clear();
+        let mut cache = manager_cache.lock();
+        // In-flight renders can keep the old manager alive. Evict its cache
+        // entry anyway so the next render reads the newly saved project.
+        for key in keys { cache.pop(&key); }
+    }
+
     pub fn disable_opencl(&mut self) {
         if !self.opencl_disabled {
             unsafe { std::env::set_var("NO_OPENCL", "1") };
@@ -1052,8 +1062,10 @@ impl GyroflowPluginBaseInstance {
         if param == Params::Browse {
             let new_path = Self::browse(&params.get_string(Params::ProjectPath)?);
             if !new_path.is_empty() {
-                params.set_string(Params::ProjectPath, &new_path)?;
+                params.set_string(Params::ProjectData, "")?;
                 self.reload_values_from_project = true;
+                params.set_string(Params::ProjectPath, &new_path)?;
+                self.reload_stab(manager_cache);
             }
         }
         if param == Params::LoadLens {
@@ -1078,20 +1090,57 @@ impl GyroflowPluginBaseInstance {
             }
         }
         if param == Params::OpenGyroflow {
-            GyroflowPluginBase::open_gyroflow(params.get_string(Params::ProjectPath).ok().as_deref());
+            let path = params.get_string(Params::ProjectPath)?;
+            if path.to_ascii_lowercase().ends_with(".dng") {
+                // Send the parsed telemetry, not a DNG the stock app cannot parse.
+                // Resolve the current manager even if the user has just changed clips.
+                let result = self.stab_manager(params, manager_cache, self.timeline_size, false)
+                    .and_then(|stab| handoff::save_project(&stab, std::path::Path::new(&path)));
+                match result {
+                    Ok(project) => {
+                        let project = project.to_str().ok_or("Invalid project path")?;
+                        // This project becomes the sole source of stabilization
+                        // data. Future reloads must not fall back to the DNG.
+                        params.set_string(Params::ProjectData, "")?;
+                        self.reload_values_from_project = true;
+                        params.set_string(Params::ProjectPath, project)?;
+                        params.set_string(Params::LoadedProject, &filesystem::get_filename(&filesystem::path_to_url(project)))?;
+                        self.reload_stab(manager_cache);
+                        GyroflowPluginBase::open_gyroflow(Some(project));
+                    },
+                    Err(error) => {
+                        rfd::MessageDialog::new().set_description(format!("Unable to send CinemaDNG data to Gyroflow: {error}")).show();
+                    }
+                }
+            } else {
+                GyroflowPluginBase::open_gyroflow(Some(&path));
+            }
         }
         if param == Params::OpenRecentProject {
             let last_project = gyroflow_core::settings::get_str("lastProject", "");
             if !last_project.is_empty() {
+                params.set_string(Params::ProjectData, "")?;
+                self.reload_values_from_project = true;
                 params.set_string(Params::ProjectPath, &last_project)?;
+                self.reload_stab(manager_cache);
             }
         }
         if param == Params::ProjectPath || param == Params::ReloadProject || param == Params::DontDrawOutside || param == Params::ManualFocalLength
             || param == Params::ManualDistortionAuto || param == Params::ManualDistortion {
             if param == Params::ProjectPath || param == Params::ReloadProject {
+                let path = params.get_string(Params::ProjectPath)?;
+                // Changing source discards the previous clip's embedded copy.
+                // An explicit reload refreshes that copy from the saved file;
+                // keep portable embedded projects usable when their file is absent.
+                if (param == Params::ProjectPath && user_edited)
+                    || (param == Params::ReloadProject && std::path::Path::new(&path).is_file()) {
+                    params.set_string(Params::ProjectData, "")?;
+                }
                 self.reload_values_from_project = true;
+                self.reload_stab(manager_cache);
+            } else {
+                self.clear_stab(manager_cache);
             }
-            self.clear_stab(&manager_cache);
         }
         if param == Params::IncludeProjectData {
             let path = params.get_string(Params::ProjectPath)?;
