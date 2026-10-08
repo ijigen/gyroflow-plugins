@@ -13,7 +13,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// This build. Bump it with each `fpsup-vX.Y.Z` tag.
-pub const RELEASE: &str = "0.1.5";
+pub const RELEASE: &str = "0.1.6";
 
 /// A release number, compared part by part: 0.1.10 is after 0.1.9.
 pub type Version = (u32, u32, u32);

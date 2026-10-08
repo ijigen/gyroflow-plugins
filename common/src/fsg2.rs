@@ -395,6 +395,9 @@ pub fn to_messages_with(frames: &[(Record, DngInfo)], options: &Options) -> Resu
     // The take's lens table, normally on its first frame; frames without one in
     // reach fall back to their own WarpRectilinear opcode.
     let lens_table = frames.iter().find_map(|(record, _)| record.lens_table.as_ref());
+    // A zoom during the take: the table holds the focal length the take started
+    // at, so it only describes the frames still there.
+    let zoom = zoom_start(frames);
 
     let vd_positions = vd_frame_positions(frames, fps)?;
     let mut next_global: u64 = 0;
@@ -438,7 +441,7 @@ pub fn to_messages_with(frames: &[(Record, DngInfo)], options: &Options) -> Resu
         }
         for (_, value) in level_iter { held_accel = value; }
 
-        let lens = lens_data(lens_table, record, dng, width, height, options);
+        let lens = lens_data(lens_table, zoom, record, dng, width, height, options);
         let frame = gyroflow_proto::FrameMetadata {
             start_timestamp_us: start,
             end_timestamp_us: start + record.readout_ns as f64 / 1000.0,
@@ -467,7 +470,22 @@ pub fn to_messages_with(frames: &[(Record, DngInfo)], options: &Options) -> Resu
 /// camera's correction data reaches this frame - the camera matrix and fisheye
 /// coefficients fitted for this frame's focus, so breathing and distortion
 /// follow a focus pull.
-fn lens_data(table: Option<&LensTable>, record: &Record, dng: &DngInfo, width: u32, height: u32, options: &Options) -> gyroflow_proto::LensData {
+/// Focal lengths (mm) that differ by less than this are the same zoom position:
+/// the mount reports tenths of a millimetre.
+const SAME_FOCAL_MM: f64 = 0.05;
+
+/// The focal length the mount reported on the take's first frame, when the
+/// take's frames do not all report the same one (a zoom lens moved); None for
+/// a take at one focal length, or without one.
+pub fn zoom_start(frames: &[(Record, DngInfo)]) -> Option<f64> {
+    let mut focals = frames.iter()
+        .filter_map(|(_, dng)| dng.focal_length_mm)
+        .filter(|mm| mm.is_finite() && *mm > 0.0);
+    let start = focals.next()?;
+    focals.any(|mm| (mm - start).abs() >= SAME_FOCAL_MM).then_some(start)
+}
+
+fn lens_data(table: Option<&LensTable>, zoom: Option<f64>, record: &Record, dng: &DngInfo, width: u32, height: u32, options: &Options) -> gyroflow_proto::LensData {
     let distance_mm = dng.subject_distance_m.map(|m| m * 1000.0);
     // No focal length from the mount: a lens without electronic contacts. The
     // camera's correction table may still be the last electronic lens's, so it
@@ -488,6 +506,9 @@ fn lens_data(table: Option<&LensTable>, record: &Record, dng: &DngInfo, width: u
         }
         return lens;
     }
+    // In a zoomed take, a frame away from the starting focal length takes its
+    // own: the mount's number and the camera's opcode written for that frame.
+    let table = table.filter(|_| zoom.is_none_or(|start| dng.focal_length_mm.is_some_and(|mm| (mm - start).abs() < SAME_FOCAL_MM)));
     let (kr, focal_mm) = match table {
         Some(table) => (
             lensfit::interpolate(&table.axis, &table.nodes, distance_mm),
@@ -865,6 +886,49 @@ mod tests {
         let lens = lens_of(&plain[0]);
         assert!(lens.distortion.is_none() && lens.camera_intrinsic_matrix.is_empty());
         assert_eq!(lens.focal_length_mm, Some(28.0));
+    }
+
+    #[test]
+    fn lens_follows_a_zoom_away_from_the_tables_focal_length() {
+        let opcode = [1.000334, -0.01484, 0.00518, -0.009761];
+        let mut first = record(0, 0, vec![[0, 0, 0]]);
+        first.flags |= FLAG_LENS_TABLE;
+        first.lens_table = Some(lumix_40_table());
+        first.crop[2] = 6000;
+        let mut frames = vec![first];
+        for n in 1..3 {
+            let mut next = record(n, n, vec![[0, 0, 0]]);
+            next.crop[2] = 6000;
+            frames.push(next);
+        }
+        let at = |mm: f64| DngInfo { frame_size: Some((1936, 1090)), focal_length_mm: Some(mm), subject_distance_m: None, warp_rectilinear: Some(opcode), ..dng() };
+        let frames: Vec<_> = frames.into_iter().zip([at(40.0), at(60.0), at(40.0)]).collect();
+        let messages = to_messages(&with_vd(frames)).unwrap();
+
+        // At the take's starting focal length: the table, as without a zoom.
+        for index in [0, 2] {
+            let lens = lens_of(&messages[index]);
+            assert!((lens.camera_intrinsic_matrix[0] as f64 - 2130.954872120334).abs() < 1e-2, "frame {index}");
+            assert!((fisheye(lens)[0] as f64 - 0.3434034356654717).abs() < 1e-6, "frame {index}");
+        }
+        // Zoomed to 60 mm: the mount's focal length and the frame's own opcode.
+        let zoomed = lens_of(&messages[1]);
+        assert_eq!(zoomed.focal_length_mm, Some(60.0));
+        let focal = 1936.0 * 60.0 / 35.9 * 1.000334;
+        assert!((zoomed.camera_intrinsic_matrix[0] as f64 - focal).abs() < 1e-2);
+        assert_eq!(zoomed.camera_intrinsic_matrix[0], zoomed.camera_intrinsic_matrix[4]);
+    }
+
+    #[test]
+    fn a_take_at_one_focal_length_is_not_a_zoom() {
+        let take = |mm: [f64; 3]| -> Vec<(Record, DngInfo)> {
+            mm.iter().enumerate().map(|(n, mm)| (record(n as u32, n as u32, vec![]), DngInfo { focal_length_mm: Some(*mm), ..dng() })).collect()
+        };
+        assert_eq!(zoom_start(&take([28.0, 28.0, 28.0])), None);
+        assert_eq!(zoom_start(&take([28.0, 28.0, 28.02])), None);
+        assert_eq!(zoom_start(&take([24.0, 24.0, 35.0])), Some(24.0));
+        let manual: Vec<_> = (0..3).map(|n| (record(n, n, vec![]), DngInfo { focal_length_mm: None, ..dng() })).collect();
+        assert_eq!(zoom_start(&manual), None);
     }
 
     #[test]
