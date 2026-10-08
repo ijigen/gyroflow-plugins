@@ -19,6 +19,7 @@ deploy:
     cp "deploy/gyroflow_ofx.dll" "gyroflow-ofx-windows/fpSupGyroflow.ofx.bundle/Contents/Win64/fpSupGyroflow.ofx"
     cp "{{justfile_directory()}}/res/Info.plist" "gyroflow-ofx-windows/fpSupGyroflow.ofx.bundle/Contents/"
     cp "{{justfile_directory()}}/../LICENSE" "gyroflow-ofx-windows/fpSupGyroflow.ofx.bundle/Contents/"
+    cp "{{justfile_directory()}}/res/Install-Windows.bat" "gyroflow-ofx-windows/"
     cd gyroflow-ofx-windows ; 7z a ../fpSupGyroflow-OpenFX-windows.zip .
 
 [macos]
@@ -73,6 +74,15 @@ deploy:
     pushd gyroflow-ofx-macos
         zip -r ../fpSupGyroflow-OpenFX-macos.zip fpSupGyroflow.ofx.bundle
     popd
+
+    # An installer package, as sigma-fp-raw ships: right-click > Open, then the installer;
+    # no Terminal step, as files a package installs carry no quarantine. Not relocatable:
+    # otherwise Installer puts it wherever another copy of the bundle id already sits.
+    rm -rf pkgroot component.plist fpSupGyroflow-OpenFX-macos.pkg && mkdir pkgroot
+    ditto gyroflow-ofx-macos/fpSupGyroflow.ofx.bundle pkgroot/fpSupGyroflow.ofx.bundle
+    pkgbuild --analyze --root pkgroot component.plist
+    plutil -replace 0.BundleIsRelocatable -bool NO component.plist && plutil -replace 0.BundleIsVersionChecked -bool NO component.plist
+    pkgbuild --root pkgroot --component-plist component.plist --identifier io.github.ijigen.fpsup.gyroflow.pkg --version "$version" --install-location /Library/OFX/Plugins fpSupGyroflow-OpenFX-macos.pkg
 
     ln -sf /Library/OFX/Plugins "gyroflow-ofx-macos/"
     hdiutil create "fpSupGyroflow-OpenFX-macos.dmg" -volname "Gyroflow OpenFX plugin" -fs HFS+ -srcfolder "gyroflow-ofx-macos/" -ov -format UDZO -imagekey zlib-level=9

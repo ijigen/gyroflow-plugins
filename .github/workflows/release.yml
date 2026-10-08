@@ -97,6 +97,11 @@ jobs:
         with:
           name: fpSupGyroflow-OpenFX-${{ matrix.targets.type }}-zip
           path: target/fpSupGyroflow-OpenFX-macos.zip
+      - uses: actions/upload-artifact@v4
+        if: ${{ matrix.targets.type == 'macos' }}
+        with:
+          name: fpSupGyroflow-OpenFX-${{ matrix.targets.type }}-pkg
+          path: target/fpSupGyroflow-OpenFX-macos.pkg
   github_release:
     name: Create GitHub release
     needs: build
