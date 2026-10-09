@@ -1,21 +1,15 @@
-Gyro2 CinemaDNG footage can now be opened in the stock Gyroflow app directly from the fpSup plugin.
+Fixes a DaVinci Resolve crash on Windows PCs that have both an NVIDIA card and an Intel integrated GPU.
 
-### Workflow
+### The crash
 
-1. In the DaVinci Resolve plugin, click **Open in Gyroflow**.
-2. Make your changes in Gyroflow, then use the arrow beside **Export** and select **Save project file**.
-3. Return to the plugin and click **Reload project** to apply your changes.
+With Resolve's GPU processing mode set to CUDA, Resolve crashed a few seconds after opening a timeline that used the plugin. Windows crash dumps placed the fault in the Intel Vulkan driver (`igvk64.dll`). To find the Vulkan GPU that matches the CUDA device, Gyroflow's core created a device on every Vulkan GPU, the Intel one included, and the older Intel driver crashed while doing so.
 
-The plugin creates a persistent `.gyroflow` project containing the parsed motion samples, frame timing and lens data, and switches its **Data source** to that project. After reloading, the saved project supplies the stabilization data. To use the original camera data again, select a DNG frame with **Browse**. If you save the project to another path, select that project in the plugin with **Browse**.
+### The fix
 
-### Reload fixes
+The plugin is now built from Gyroflow core with one change (ijigen/gyroflow, branch `fpsup-core`): only NVIDIA GPUs are checked, because a CUDA device is always an NVIDIA one. Intel and other GPUs are no longer touched on the CUDA path.
 
-- Reload refreshes the saved project even when **Embed .gyroflow data in plugin** is enabled.
-- Old cached data is discarded on reload, including while a render still holds the previous data.
-- Embedded projects remain usable when their external project file is unavailable.
+If you switched Resolve to OpenCL to avoid the crash, you can switch back to CUDA (Preferences > Memory and GPU > GPU processing mode), where playback is faster.
 
-### Validation and known limitation
+### Validation
 
-The complete workflow was tested on macOS with DaVinci Resolve Studio 21 and stock Gyroflow 1.6.3, including saving a changed Smoothness value and reloading it into the plugin with embedded data enabled. The automated suite passed 59 tests, and a real clip round-trip preserved all 54,284 IMU samples, 649 frame timing entries and 649 lens records.
-
-Gyroflow's DNG decoder can include sensor borders outside the active crop, causing a lens dimensions warning. This release transfers the telemetry and saved edits; the RAW dimensions mismatch still needs attention before relying on Gyroflow's rendered video output.
+macOS behaviour is unchanged, because the changed code is only built for Windows and Linux. The fix has not yet been confirmed on a Windows PC that had the crash.

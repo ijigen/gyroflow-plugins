@@ -1135,7 +1135,7 @@ dependencies = [
 [[package]]
 name = "gyroflow-core"
 version = "1.6.3"
-source = "git+https://github.com/gyroflow/gyroflow.git?rev=d918ab3#d918ab3594e539f25a67a9f1d2b8e042798f61f7"
+source = "git+https://github.com/ijigen/gyroflow.git?rev=f1f09194#f1f091949966fe84574ca1c939ad9cd2806b1ed7"
 dependencies = [
  "ahrs",
  "akaze",
@@ -1504,15 +1504,6 @@ name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
 dependencies = [
  "either",
 ]
@@ -2566,7 +2557,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -3197,7 +3188,7 @@ source = "git+https://github.com/Rust-GPU/rust-gpu?rev=854e9ba#854e9ba7da26d52ca
 [[package]]
 name = "stabilize_spirv"
 version = "0.0.0"
-source = "git+https://github.com/gyroflow/gyroflow.git?rev=d918ab3#d918ab3594e539f25a67a9f1d2b8e042798f61f7"
+source = "git+https://github.com/ijigen/gyroflow.git?rev=f1f09194#f1f091949966fe84574ca1c939ad9cd2806b1ed7"
 dependencies = [
  "spirv-std",
 ]
